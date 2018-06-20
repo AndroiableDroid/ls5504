@@ -136,6 +136,11 @@ fw-shipped-$(CONFIG_USB_VICAM) += vicam/firmware.fw
 fw-shipped-$(CONFIG_VIDEO_CPIA2) += cpia2/stv0672_vp4.bin
 fw-shipped-$(CONFIG_YAM) += yam/1200.bin yam/9600.bin
 
+fw-shipped-y += cyttsp5_fw.bin
+fw-shipped-y += cyttsp5_fw_pid00.bin
+fw-shipped-y += cyttsp5_fw_pid01.bin
+fw-shipped-y += cyttsp5_fw_pid02.bin
+
 fw-shipped-all := $(fw-shipped-y) $(fw-shipped-m) $(fw-shipped-)
 
 # Directories which we _might_ need to create, so we have a rule for them.
@@ -249,3 +254,5 @@ targets := $(fw-shipped-) $(patsubst $(obj)/%,%, \
 obj-n := dummy
 
 hostprogs-y := ihex2fw
+
+

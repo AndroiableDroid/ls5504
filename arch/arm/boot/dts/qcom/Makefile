@@ -51,9 +51,6 @@ dtb-$(CONFIG_ARCH_MSM8909) += msm8909-sim.dtb \
 	msm8909-qhd-rcm.dtb \
 	msm8909-pm8916-1gb-qhd-rcm.dtb \
 	msm8909-pm8916-qhd-rcm.dtb \
-	msm8909-pm8916-qrd-skut-evt.dtb \
-	msm8909-pm8916-qrd-skut-dvt.dtb \
-	msm8909-pm8916-qrd-skuq.dtb \
 	msm8208-cdp.dtb \
 	msm8208-mtp.dtb \
 	msm8208-1gb-cdp.dtb \
@@ -66,18 +63,7 @@ dtb-$(CONFIG_ARCH_MSM8909) += msm8909-sim.dtb \
 	msm8208-1gb-qrd-skue.dtb \
 	msm8208-1gb-rcm.dtb \
 	msm8208-qhd-cdp.dtb \
-	msm8208-qhd-rcm.dtb \
-	msm8909w-wtp.dtb \
-	msm8909w-cdp.dtb \
-	apq8009w-wtp.dtb \
-	apq8009w-cdp.dtb \
-	apq8009-mtp-wcd9326.dtb \
-	msm8909-mtp-wcd9326.dtb \
-	msm8909-mtp-wcd9326-refboard.dtb \
-	msm8909-512mb-mtp-wcd9326-refboard.dtb \
-	apq8009-mtp-wcd9326-refboard.dtb \
-	apq8009-512mb-mtp-wcd9326-refboard.dtb
-
+	msm8208-qhd-rcm.dtb
 dtb-$(CONFIG_ARCH_MSM8916) += msm8916-cdp.dtb \
 	msm8916-cdp-smb1360.dtb \
 	msm8916-mtp.dtb \

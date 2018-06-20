@@ -46,6 +46,7 @@
 #define X86_EFLAGS_ID_BIT	21 /* CPUID detection */
 #define X86_EFLAGS_ID		_BITUL(X86_EFLAGS_ID_BIT)
 
+
 /*
  * Basic CPU control in CR0
  */

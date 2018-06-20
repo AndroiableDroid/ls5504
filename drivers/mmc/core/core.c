@@ -400,9 +400,7 @@ EXPORT_SYMBOL(mmc_blk_init_bkops_statistics);
  */
 void mmc_start_delayed_bkops(struct mmc_card *card)
 {
-	if (!card ||
-		!(mmc_card_get_bkops_en_manual(card)) ||
-		mmc_card_doing_bkops(card))
+	if (!card || !card->ext_csd.bkops_en || mmc_card_doing_bkops(card))
 		return;
 
 	if (card->bkops_info.sectors_changed <
@@ -439,7 +437,7 @@ void mmc_start_bkops(struct mmc_card *card, bool from_exception)
 	int err;
 
 	BUG_ON(!card);
-	if (!(mmc_card_get_bkops_en_manual(card)))
+	if (!card->ext_csd.bkops_en)
 		return;
 
 	if ((card->bkops_info.cancel_delayed_work) && !from_exception) {
@@ -540,8 +538,8 @@ static void mmc_wait_data_done(struct mmc_request *mrq)
 	struct mmc_context_info *context_info = &mrq->host->context_info;
 
 	spin_lock_irqsave(&context_info->lock, flags);
-	context_info->is_done_rcv = true;
-	wake_up_interruptible(&context_info->wait);
+	mrq->host->context_info.is_done_rcv = true;
+	wake_up_interruptible(&mrq->host->context_info.wait);
 	spin_unlock_irqrestore(&context_info->lock, flags);
 }
 
@@ -3357,6 +3355,7 @@ int mmc_detect_card_removed(struct mmc_host *host)
 	return ret;
 }
 EXPORT_SYMBOL(mmc_detect_card_removed);
+static  int max_retry = 11;
 
 void mmc_rescan(struct work_struct *work)
 {
@@ -3430,8 +3429,20 @@ void mmc_rescan(struct work_struct *work)
 	if (extend_wakelock && !host->rescan_disable)
 		wake_lock_timeout(&host->detect_wake_lock, HZ / 2);
 
-	if (host->caps & MMC_CAP_NEEDS_POLL)
-		mmc_schedule_delayed_work(&host->detect, HZ);
+	//add by lidan for sd card hotplug
+	max_retry--;
+ 	 if( max_retry > 0) //max try 10 times to open file
+	{
+  		mmc_schedule_delayed_work(&host->detect, HZ);
+	}else
+	 {
+		max_retry=11;
+	}
+	printk("mmc_rescan -----max_retry=%d\n",max_retry );
+	//add by lidan for sd card hotplug
+
+	//if (host->caps & MMC_CAP_NEEDS_POLL)
+	//	mmc_schedule_delayed_work(&host->detect, HZ);
 }
 
 void mmc_start_host(struct mmc_host *host)

@@ -164,10 +164,9 @@ static ssize_t sps_set_info(struct file *file, const char __user *buf,
 	int i;
 	u32 buf_size_kb = 0;
 	u32 new_buf_size;
-	u32 size = sizeof(str) < count ? sizeof(str) : count;
 
 	memset(str, 0, sizeof(str));
-	missing = copy_from_user(str, buf, size);
+	missing = copy_from_user(str, buf, sizeof(str));
 	if (missing)
 		return -EFAULT;
 
@@ -255,10 +254,9 @@ static ssize_t sps_set_logging_option(struct file *file, const char __user *buf,
 	char str[MAX_MSG_LEN];
 	int i;
 	u8 option = 0;
-	u32 size = sizeof(str) < count ? sizeof(str) : count;
 
 	memset(str, 0, sizeof(str));
-	missing = copy_from_user(str, buf, size);
+	missing = copy_from_user(str, buf, sizeof(str));
 	if (missing)
 		return -EFAULT;
 
@@ -305,10 +303,9 @@ static ssize_t sps_set_bam_addr(struct file *file, const char __user *buf,
 	struct sps_bam *bam;
 	u32 num_pipes = 0;
 	void *vir_addr;
-	u32 size = sizeof(str) < count ? sizeof(str) : count;
 
 	memset(str, 0, sizeof(str));
-	missing = copy_from_user(str, buf, size);
+	missing = copy_from_user(str, buf, sizeof(str));
 	if (missing)
 		return -EFAULT;
 
@@ -2199,7 +2196,6 @@ EXPORT_SYMBOL(sps_register_bam_device);
 int sps_deregister_bam_device(unsigned long dev_handle)
 {
 	struct sps_bam *bam;
-	int n;
 
 	SPS_DBG2("sps:%s.", __func__);
 
@@ -2215,12 +2211,6 @@ int sps_deregister_bam_device(unsigned long dev_handle)
 	}
 
 	SPS_DBG2("sps:SPS deregister BAM: phys %pa.", &bam->props.phys_addr);
-
-	if (bam->props.options & SPS_BAM_HOLD_MEM) {
-		for (n = 0; n < BAM_MAX_PIPES; n++)
-			if (bam->desc_cache_pointers[n] != NULL)
-				kfree(bam->desc_cache_pointers[n]);
-	}
 
 	/* If this BAM is attached to a BAM-DMA, init the BAM-DMA device */
 #ifdef CONFIG_SPS_SUPPORT_BAMDMA

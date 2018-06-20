@@ -28,8 +28,9 @@
 #include <linux/of_gpio.h>
 #include <linux/bitops.h>
 #include <linux/qpnp/qpnp-adc.h>
+#include <linux/alarmtimer.h>
+#include <linux/wakelock.h> //PVT1 for ac charge  not into  deep sleep  added by yuyuanjiang 
 #include <linux/completion.h>
-#include <linux/pm_wakeup.h>
 
 #define _SMB1360_MASK(BITS, POS) \
 	((unsigned char)(((1 << (BITS)) - 1) << (POS)))
@@ -62,7 +63,6 @@
 #define CHG_EN_BY_PIN_BIT		BIT(7)
 #define CHG_EN_ACTIVE_LOW_BIT		BIT(6)
 #define PRE_TO_FAST_REQ_CMD_BIT		BIT(5)
-#define CFG_BAT_OV_ENDS_CHG_CYC		BIT(4)
 #define CHG_CURR_TERM_DIS_BIT		BIT(3)
 #define CFG_AUTO_RECHG_DIS_BIT		BIT(2)
 #define CFG_CHG_INHIBIT_EN_BIT		BIT(0)
@@ -249,6 +249,34 @@
 #define FG_RESET_THRESHOLD_MV		15
 #define SMB1360_REV_1			0x01
 
+#define HIPAD_CAPACITY_THRESHOLD 5  //10
+#define HIPAD_TERM_THRESHOLD   8
+#define HIPAD_BATTERY_FULL_THRESHOLD  10  // 10*15*7s   
+#define TEMP_CHECK_PERIOD_START_MS	30000//30000
+#define HIPAD_DELTA_TEMP	30//(370)
+#define TEMP_CHECK_PERIOD_HOLD_MS	7000 //30000
+#define TEMP_CHECK_PERIOD_DISCHARGE_MS	5000 //30000
+#define HIPAD_VOLTAGE_COMPENSATION  35  // 35mv
+#define POWER_STAGE_REDUCE_CHECK_PERIOD_NS		(30LL * NSEC_PER_SEC)
+#define TEMP_CHECK_PERIOD_ALARM_MS	2000//30000
+#define SAMPLE_TEMP_COUNT 5
+#define WORK_THRESHOLD   25
+int current_buffer[SAMPLE_TEMP_COUNT];
+#define CHGR_STEADY
+#define READ_DELAY_NUM   (3)
+#define BATTERY_PERNUM_OFFSET (8)
+#define BATTERY_DECREASE_PERNUM_OFFSET (3)
+#define USB_TYPE 4
+#define AC_TYPE 5
+
+/*--------------------------- charge debug,liwei add 20150803,start ----------------------------*/
+#if 1
+#define pr_log(fmt, arg...)	printk("SMB %s: " fmt, __func__, ##arg)
+#else
+#define pr_log(fmt, arg...)	no_printk(fmt, ##arg)
+#endif
+/*-----------------------------liwei add 20150803,end----------------------------------------*/
+
 #define SMB1360_POWERON_DELAY_MS	2000
 #define SMB1360_FG_RESET_DELAY_MS	1500
 
@@ -285,42 +313,9 @@ enum {
 
 static int otg_curr_ma[] = {350, 550, 950, 1500};
 
-struct otp_backup_pool {
-	u8 reg_start;
-	u8 reg_end;
-	u8 start_now;
-	u16 alg_bitmap;
-	bool initialized;
-	struct mutex lock;
-};
-
-enum otp_backup_alg {
-	OTP_BACKUP_NOT_USE = 0,
-	OTP_BACKUP_FG_USE,
-	OTP_BACKUP_PROF_A_USE,
-	OTP_BACKUP_PROF_B_USE,
-};
-
 struct smb1360_otg_regulator {
 	struct regulator_desc	rdesc;
 	struct regulator_dev	*rdev;
-};
-
-enum wakeup_src {
-	WAKEUP_SRC_FG_ACCESS = 0,
-	WAKEUP_SRC_JEITA_SOFT,
-	WAKEUP_SRC_PARALLEL,
-	WAKEUP_SRC_MIN_SOC,
-	WAKEUP_SRC_EMPTY_SOC,
-	WAKEUP_SRC_JEITA_HYSTERSIS,
-	WAKEUP_SRC_MAX,
-};
-#define WAKEUP_SRC_MASK (~(~0 << WAKEUP_SRC_MAX))
-
-struct smb1360_wakeup_source {
-	struct wakeup_source source;
-	unsigned long enabled_bitmap;
-	spinlock_t ws_lock;
 };
 
 struct smb1360_chip {
@@ -330,14 +325,32 @@ struct smb1360_chip {
 	u8				soft_hot_rt_stat;
 	u8				soft_cold_rt_stat;
 	struct delayed_work		jeita_work;
+
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+	#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+	struct delayed_work 	temp_check_work;
+	#endif
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
+
+	/*liwei add for lower the charge_current, @20150728, start*/
+	#ifdef	CONFIG_HIPAD_ADJUST_CHARGING_CURRENT	
+	bool					hipad_usb_present;
+	struct delayed_work		adjust_charging_current_work;
+	#endif
+	struct delayed_work		adjust_charging_soc_work;
+	//struct work_struct		hipad_soc_work;
+	//struct alarm			battery_alarm;
+	/*liwei add for lower the charge_current, @20150728, end*/
+	atomic_t 				hipad_lock_enable;
+	int                               hipad_voltage_first;
+       int 					hipad_capacity;
+	int 					capcity_reference;
+	int 					term_count;
 	struct delayed_work		delayed_init_work;
 	unsigned short			default_i2c_addr;
 	unsigned short			fg_i2c_addr;
 	bool				pulsed_irq;
 	struct completion		fg_mem_access_granted;
-
-	/* wakeup source */
-	struct smb1360_wakeup_source	smb1360_ws;
 
 	/* configuration data - charger */
 	int				fake_battery_soc;
@@ -349,7 +362,6 @@ struct smb1360_chip {
 	bool				shdn_after_pwroff;
 	bool				config_hard_thresholds;
 	bool				soft_jeita_supported;
-	bool				ov_ends_chg_cycle_disabled;
 	int				iterm_ma;
 	int				vfloat_mv;
 	int				safety_time;
@@ -364,6 +376,14 @@ struct smb1360_chip {
 	int				hot_bat_decidegc;
 	int				cool_bat_decidegc;
 	int				warm_bat_decidegc;
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+	#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+	int				hipad_hot_bat_decidegc;
+	int				hipad_warm_bat_decidegc;
+	int				hipad_cool_bat_decidegc;
+	int				hipad_cold_bat_decidegc;
+	#endif
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
 	int				cool_bat_mv;
 	int				warm_bat_mv;
 	int				cool_bat_ma;
@@ -413,9 +433,11 @@ struct smb1360_chip {
 	bool				batt_warm;
 	bool				batt_cool;
 	bool				batt_full;
+	bool                      charger_overvoltage;    //charger voltage higher than 6.5 V,then charger_overvoltage is setted true,liwei add 20150730
+	bool                      use_voltage;
+	bool                      hipad_is_full;
 	bool				resume_completed;
 	bool				irq_waiting;
-	bool				irq_disabled;
 	bool				empty_soc;
 	bool				awake_min_soc;
 	int				workaround_flags;
@@ -430,6 +452,11 @@ struct smb1360_chip {
 	u32				fg_peek_poke_address;
 	int				skip_writes;
 	int				skip_reads;
+	int				last_temp;
+
+	int 			is_pvt1;	
+	int 			is_pvt2;
+	
 	struct dentry			*debug_root;
 
 	struct qpnp_vadc_chip		*vadc_dev;
@@ -443,18 +470,12 @@ struct smb1360_chip {
 	struct mutex			read_write_lock;
 	struct mutex			parallel_chg_lock;
 	struct work_struct		parallel_work;
+	struct delayed_work		temp_work;
 	struct mutex			otp_gain_lock;
 	struct mutex			fg_access_request_lock;
-	struct otp_backup_pool		otp_backup;
-	u8				current_gain_otp_reg;
-	bool				otp_hard_jeita_config;
-	int				otp_cold_bat_decidegc;
-	int				otp_hot_bat_decidegc;
-	u8				hard_jeita_otp_reg;
-	struct work_struct		jeita_hysteresis_work;
-	int				cold_hysteresis;
-	int				hot_hysteresis;
 };
+
+static struct wake_lock hipad_chg_wake_lock; 
 
 static int chg_time[] = {
 	192,
@@ -471,44 +492,6 @@ static int input_current_limit[] = {
 static int fastchg_current[] = {
 	450, 600, 750, 900, 1050, 1200, 1350, 1500,
 };
-
-static void smb1360_stay_awake(struct smb1360_wakeup_source *source,
-	enum wakeup_src wk_src)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&source->ws_lock, flags);
-
-	if (!__test_and_set_bit(wk_src, &source->enabled_bitmap)) {
-		__pm_stay_awake(&source->source);
-		pr_debug("enabled source %s, wakeup_src %d\n",
-			source->source.name, wk_src);
-	}
-	spin_unlock_irqrestore(&source->ws_lock, flags);
-}
-
-static void smb1360_relax(struct smb1360_wakeup_source *source,
-	enum wakeup_src wk_src)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&source->ws_lock, flags);
-	if (__test_and_clear_bit(wk_src, &source->enabled_bitmap) &&
-		!(source->enabled_bitmap & WAKEUP_SRC_MASK)) {
-		__pm_relax(&source->source);
-		pr_debug("disabled source %s\n", source->source.name);
-	}
-	spin_unlock_irqrestore(&source->ws_lock, flags);
-
-	pr_debug("relax source %s, wakeup_src %d\n",
-		source->source.name, wk_src);
-}
-
-static void smb1360_wakeup_src_init(struct smb1360_chip *chip)
-{
-	spin_lock_init(&chip->smb1360_ws.ws_lock);
-	wakeup_source_init(&chip->smb1360_ws.source, "smb1360");
-}
 
 static int is_between(int value, int left, int right)
 {
@@ -700,32 +683,6 @@ out:
 	return rc;
 }
 
-static int smb1360_select_fg_i2c_address(struct smb1360_chip *chip)
-{
-	unsigned short addr = chip->default_i2c_addr << 0x1;
-
-	switch (chip->fg_access_type) {
-	case FG_ACCESS_CFG:
-		addr = (addr & ~FG_I2C_CFG_MASK) | FG_CFG_I2C_ADDR;
-		break;
-	case FG_ACCESS_PROFILE_A:
-		addr = (addr & ~FG_I2C_CFG_MASK) | FG_PROFILE_A_ADDR;
-		break;
-	case FG_ACCESS_PROFILE_B:
-		addr = (addr & ~FG_I2C_CFG_MASK) | FG_PROFILE_B_ADDR;
-		break;
-	default:
-		pr_err("Invalid FG access type=%d\n", chip->fg_access_type);
-		return -EINVAL;
-	}
-
-	chip->fg_i2c_addr = addr >> 0x1;
-	pr_debug("FG_access_type=%d fg_i2c_addr=%x\n", chip->fg_access_type,
-							chip->fg_i2c_addr);
-
-	return 0;
-}
-
 #define EXPONENT_MASK		0xF800
 #define MANTISSA_MASK		0x3FF
 #define SIGN_MASK		0x400
@@ -854,7 +811,7 @@ static int smb1360_enable_fg_access(struct smb1360_chip *chip)
 	 * check if the access was granted before
 	 */
 	mutex_lock(&chip->fg_access_request_lock);
-	smb1360_stay_awake(&chip->smb1360_ws, WAKEUP_SRC_FG_ACCESS);
+	pm_stay_awake(chip->dev);
 	rc = smb1360_read(chip, IRQ_I_REG, &reg);
 	if (rc) {
 		pr_err("Couldn't read IRQ_I_REG, rc=%d\n", rc);
@@ -895,7 +852,7 @@ static int smb1360_enable_fg_access(struct smb1360_chip *chip)
 	}
 
 bail_i2c:
-	smb1360_relax(&chip->smb1360_ws, WAKEUP_SRC_FG_ACCESS);
+	pm_relax(chip->dev);
 	mutex_unlock(&chip->fg_access_request_lock);
 	return rc;
 }
@@ -927,68 +884,6 @@ static int smb1360_enable_volatile_writes(struct smb1360_chip *chip)
 	if (rc < 0)
 		dev_err(chip->dev,
 			"Couldn't set VOLATILE_W_PERM_BIT rc=%d\n", rc);
-
-	return rc;
-}
-
-void smb1360_otp_backup_pool_init(struct smb1360_chip *chip)
-{
-	struct otp_backup_pool *pool = &chip->otp_backup;
-
-	pool->reg_start = 0xE0;
-	pool->reg_end = 0xEF;
-	pool->start_now = pool->reg_start;
-	mutex_init(&pool->lock);
-}
-
-static int smb1360_alloc_otp_backup_register(struct smb1360_chip *chip,
-						u8 size, int usage)
-{
-	int rc = 0, i;
-	u8 inv_pos;
-	struct otp_backup_pool *pool = &chip->otp_backup;
-
-	if (size % 2) {
-		pr_err("Must be allocated with pairs\n");
-		return -EINVAL;
-	}
-
-	mutex_lock(&pool->lock);
-	if (pool->start_now + size > pool->reg_end) {
-		pr_err("Allocation fail: start = 0x%x, size = %d\n",
-						pool->start_now, size);
-		mutex_unlock(&pool->lock);
-		return -EBUSY;
-	}
-	rc = pool->start_now;
-	inv_pos = pool->reg_end - pool->start_now + 1;
-	for (i = 0; i < size; i = i + 2) {
-		inv_pos -= i;
-		pool->alg_bitmap |= usage << (inv_pos - 2);
-	}
-	pr_debug("Allocation success, start = 0x%x, size = %d, alg_bitmap = 0x%x\n",
-						rc, size, pool->alg_bitmap);
-	pool->start_now += size;
-	mutex_unlock(&pool->lock);
-
-	return rc;
-}
-
-#define OTP_BACKUP_WA_ALG_1	0xF0
-#define OTP_BACKUP_WA_ALG_2	0xF1
-static int smb1360_otp_backup_alg_update(struct smb1360_chip *chip)
-{
-	int rc = 0;
-	struct otp_backup_pool *pool = &chip->otp_backup;
-
-	mutex_lock(&pool->lock);
-	rc = smb1360_fg_write(chip, OTP_BACKUP_WA_ALG_1,
-			(u8)(pool->alg_bitmap >> 8));
-	rc |= smb1360_fg_write(chip, OTP_BACKUP_WA_ALG_2,
-			(u8)(pool->alg_bitmap));
-	if (rc)
-		pr_err("Write FG address F0/F1 failed, rc = %d\n", rc);
-	mutex_unlock(&pool->lock);
 
 	return rc;
 }
@@ -1150,9 +1045,19 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 
 	if (is_device_suspended(chip))
 		return POWER_SUPPLY_STATUS_UNKNOWN;
-
-	if (chip->batt_full)
-		return POWER_SUPPLY_STATUS_FULL;
+	
+	if(chip->use_voltage )
+	{
+		if(chip->usb_present && (chip->hipad_capacity== 100))
+		  return POWER_SUPPLY_STATUS_FULL;
+	}
+	else
+	{
+		if (chip->usb_present && (chip->soc_now == 100))
+			return POWER_SUPPLY_STATUS_FULL;
+		if (chip->batt_full)
+			return POWER_SUPPLY_STATUS_FULL;
+	}
 
 	rc = smb1360_read(chip, STATUS_3_REG, &reg);
 	if (rc) {
@@ -1160,17 +1065,58 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 		return POWER_SUPPLY_STATUS_UNKNOWN;
 	}
 
-	pr_debug("STATUS_3_REG = %x\n", reg);
+	//pr_log("STATUS_3_REG = %x\n", reg);
 
-	if (reg & CHG_HOLD_OFF_BIT)
-		return POWER_SUPPLY_STATUS_NOT_CHARGING;
 
-	chg_type = (reg & CHG_TYPE_MASK) >> CHG_TYPE_SHIFT;
+	if(chip->use_voltage )
+	{ 
+		if( chip->usb_present && (chip->hipad_capacity != 100) &&  !chip->charger_overvoltage
+			 && !chip->batt_hot && !chip->batt_cold)   //liwei modify 20100916
+		{
+			return POWER_SUPPLY_STATUS_CHARGING;
+		}
+		else
+		{
+			if (reg & CHG_HOLD_OFF_BIT)
+				return POWER_SUPPLY_STATUS_NOT_CHARGING;
 
-	if (chg_type == BATT_NOT_CHG_VAL)
-		return POWER_SUPPLY_STATUS_DISCHARGING;
+			chg_type = (reg & CHG_TYPE_MASK) >> CHG_TYPE_SHIFT;
+			//pr_log("chg_type = %x\n", chg_type);
+
+			if (chg_type == BATT_NOT_CHG_VAL)
+				return POWER_SUPPLY_STATUS_DISCHARGING;
+			else
+				return POWER_SUPPLY_STATUS_CHARGING;
+		}
+	}
 	else
-		return POWER_SUPPLY_STATUS_CHARGING;
+	{  
+
+
+		if (reg & CHG_HOLD_OFF_BIT)
+			return POWER_SUPPLY_STATUS_NOT_CHARGING;
+
+		chg_type = (reg & CHG_TYPE_MASK) >> CHG_TYPE_SHIFT;
+
+		if (chg_type == BATT_NOT_CHG_VAL)
+			return POWER_SUPPLY_STATUS_DISCHARGING;
+		else
+			return POWER_SUPPLY_STATUS_CHARGING;
+    }
+}
+
+static int smb1360_get_prop_charging_status(struct smb1360_chip *chip)
+{
+	int rc;
+	u8 reg = 0;
+
+	rc = smb1360_read(chip, STATUS_3_REG, &reg);
+	if (rc) {
+		pr_err("Couldn't read STATUS_3_REG rc=%d\n", rc);
+		return 0;
+	}
+
+	return (reg & CHG_EN_BIT) ? 1 : 0;
 }
 
 static int smb1360_get_prop_charge_type(struct smb1360_chip *chip)
@@ -1200,10 +1146,22 @@ static int smb1360_get_prop_charge_type(struct smb1360_chip *chip)
 	return POWER_SUPPLY_CHARGE_TYPE_NONE;
 }
 
+static int smb1360_get_prop_batt_temp(struct smb1360_chip *chip);   //liwei add for adjusting temp 20150807
+static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip);
+static int smb1360_get_prop_voltage_now(struct smb1360_chip *chip);
+static int hipad_vol_to_percent(struct smb1360_chip *chip, int  voltage,int status, int capacity,
+			     int update);
+static int log_flag = 0;	//zhangjiyou add for bug:74650, @20150901
 static int smb1360_get_prop_batt_health(struct smb1360_chip *chip)
 {
 	union power_supply_propval ret = {0, };
-
+	int hipad_capacity = smb1360_get_prop_batt_capacity(chip);
+	int hipad_voltage =  smb1360_get_prop_voltage_now(chip);
+	int status = smb1360_get_prop_charging_status(chip);
+	/*liwei add for adjusting temp when temp lower than 12c,start,20150807*/
+	smb1360_get_prop_batt_temp(chip);     
+	/*liwei add for adjusting temp when temp lower than 12c,end,20150807*/
+	
 	if (chip->batt_hot)
 		ret.intval = POWER_SUPPLY_HEALTH_OVERHEAT;
 	else if (chip->batt_cold)
@@ -1212,9 +1170,22 @@ static int smb1360_get_prop_batt_health(struct smb1360_chip *chip)
 		ret.intval = POWER_SUPPLY_HEALTH_WARM;
 	else if (chip->batt_cool)
 		ret.intval = POWER_SUPPLY_HEALTH_COOL;
+	else if (chip->charger_overvoltage)   //charger voltage higher than 6.5,then stop charging and set charger_overvoltage as true,liwei add 20150730
+		ret.intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
 	else
 		ret.intval = POWER_SUPPLY_HEALTH_GOOD;
 
+	/*zhangjiyou add for bug:74650, @20150901 start*/
+	if(hipad_capacity > 90 && chip->usb_present) {
+		log_flag++;
+		if(log_flag == 20){
+			pr_log("health=%d,temp=%d,current=%d,capacity=%d,voltage=%d,charge_status=%d,use_voltage=%d\n", ret.intval,chip->temp_now, chip->current_now,hipad_capacity,hipad_voltage,status,chip->use_voltage);
+			log_flag = 0;
+		}
+	} else {
+		pr_log("health=%d,temp=%d,current=%d,capacity=%d,voltage=%d,charge_status=%d,use_voltage=%d\n", ret.intval,chip->temp_now, chip->current_now,hipad_capacity,hipad_voltage,status,chip->use_voltage);
+	}
+	/*zhangjiyou add for bug:74650, @20150901 end*/
 	return ret.intval;
 }
 
@@ -1223,6 +1194,8 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 	u8 reg;
 	u32 temp = 0;
 	int rc, soc = 0;
+	static bool is_first = false;
+	int status;
 
 	if (chip->fake_battery_soc >= 0)
 		return chip->fake_battery_soc;
@@ -1233,7 +1206,17 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 	}
 
 	if (is_device_suspended(chip))
-		return chip->soc_now;
+	{
+		if(chip->use_voltage )
+		{
+		 	return chip->hipad_capacity;
+		}
+		else
+		{
+			return chip->soc_now;
+		}
+	}
+	
 
 	rc = smb1360_read(chip, SHDW_FG_MSYS_SOC, &reg);
 	if (rc) {
@@ -1251,7 +1234,29 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 
 	chip->soc_now = (chip->batt_full ? 100 : bound(soc, 0, 100));
 
-	return chip->soc_now;
+
+	if(!is_first && chip->use_voltage )
+	{
+		chip->hipad_voltage_first = smb1360_get_prop_voltage_now(chip) / 1000 ;
+		if(!chip->usb_present)
+		{
+			chip->hipad_voltage_first = chip->hipad_voltage_first + HIPAD_VOLTAGE_COMPENSATION;
+		}
+		status = smb1360_get_prop_charging_status(chip);
+		chip->hipad_capacity = hipad_vol_to_percent(chip,chip->hipad_voltage_first ,status,chip->soc_now ,0);
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_START_MS));
+	}
+	
+	is_first = true;
+			
+	if(chip->use_voltage )
+	{
+		return chip->hipad_capacity;
+	}
+	else
+	{
+		return chip->soc_now;
+	}
 }
 
 static int smb1360_get_prop_chg_full_design(struct smb1360_chip *chip)
@@ -1277,6 +1282,11 @@ static int smb1360_get_prop_chg_full_design(struct smb1360_chip *chip)
 	return chip->fcc_mah;
 }
 
+
+/*liwei add for adjusting temp when temp lower than 12c,start,20150807*/
+#define  HIPAD_HIGH_TEMP_THRESHOLD    120  
+#define  HIPAD_TEMP_COMPENSATION   30
+/*liwei add for adjusting temp when temp lower than 12c,end,20150807*/
 static int smb1360_get_prop_batt_temp(struct smb1360_chip *chip)
 {
 	u8 reg[2];
@@ -1300,6 +1310,12 @@ static int smb1360_get_prop_batt_temp(struct smb1360_chip *chip)
 
 	chip->temp_now = temp;
 
+	/*liwei add for adjusting temp when temp lower than 12c,start,20150807*/
+	//if( chip->temp_now  <= HIPAD_HIGH_TEMP_THRESHOLD)		
+	//{
+		chip->temp_now  -=HIPAD_TEMP_COMPENSATION;
+	//}  
+	/*liwei add for adjusting temp when temp lower than 12c,end,20150807*/
 	return chip->temp_now;
 }
 
@@ -1376,7 +1392,10 @@ static int smb1360_get_prop_current_now(struct smb1360_chip *chip)
 				reg[0], reg[1], temp * 1000);
 
 	chip->current_now = temp * 1000;
-
+       if(chip->use_voltage )
+	   	if (smb1360_get_prop_charging_status(chip))
+			chip->current_now -= 300*1000;
+	   	
 	return chip->current_now;
 }
 
@@ -1517,7 +1536,22 @@ static void smb1360_parallel_work(struct work_struct *work)
 	}
 
 exit_work:
-	smb1360_relax(&chip->smb1360_ws, WAKEUP_SRC_PARALLEL);
+	pm_relax(chip->dev);
+}
+
+static void smb1360_temp_work(struct work_struct *work)
+{
+	int value;
+	struct smb1360_chip *chip = container_of(work,
+				struct smb1360_chip, temp_work.work);
+
+	value = smb1360_get_prop_batt_temp(chip);
+	if (value != chip->last_temp) {
+		power_supply_changed(&chip->batt_psy);
+		chip->last_temp = value;
+	}
+
+	schedule_delayed_work(&chip->temp_work, 5*HZ);
 }
 
 static int smb1360_set_appropriate_usb_current(struct smb1360_chip *chip)
@@ -1680,7 +1714,6 @@ static int smb1360_set_jeita_comp_curr(struct smb1360_chip *chip,
 }
 
 #define TEMP_THRE_SET(x) ((x + 300) / 10)
-#define TEMP_THRE_GET(x) ((x * 10) - 300)
 static int smb1360_set_soft_jeita_threshold(struct smb1360_chip *chip,
 					int cold_threshold, int hot_threshold)
 {
@@ -1689,7 +1722,7 @@ static int smb1360_set_soft_jeita_threshold(struct smb1360_chip *chip,
 	rc = smb1360_write(chip, JEITA_SOFT_COLD_REG,
 				TEMP_THRE_SET(cold_threshold));
 	if (rc) {
-		pr_err("Couldn't set soft cold threshold, rc = %d\n", rc);
+		pr_err("Couldn't set cold threshold, rc = %d\n", rc);
 		return rc;
 	} else {
 		chip->soft_cold_thresh = cold_threshold;
@@ -1698,147 +1731,10 @@ static int smb1360_set_soft_jeita_threshold(struct smb1360_chip *chip,
 	rc = smb1360_write(chip, JEITA_SOFT_HOT_REG,
 				TEMP_THRE_SET(hot_threshold));
 	if (rc) {
-		pr_err("Couldn't set soft hot threshold, rc = %d\n", rc);
+		pr_err("Couldn't set hot threshold, rc = %d\n", rc);
 		return rc;
 	} else {
 		chip->soft_hot_thresh = hot_threshold;
-	}
-
-	return rc;
-}
-
-static int smb1360_get_soft_jeita_threshold(struct smb1360_chip *chip,
-				int *cold_threshold, int *hot_threshold)
-{
-	int rc = 0;
-	u8 value;
-
-	rc = smb1360_read(chip, JEITA_SOFT_COLD_REG, &value);
-	if (rc) {
-		pr_err("Couldn't get soft cold threshold, rc = %d\n", rc);
-		return rc;
-	}
-	*cold_threshold = TEMP_THRE_GET(value);
-
-	rc = smb1360_read(chip, JEITA_SOFT_HOT_REG, &value);
-	if (rc) {
-		pr_err("Couldn't get soft hot threshold, rc = %d\n", rc);
-		return rc;
-	}
-	*hot_threshold = TEMP_THRE_GET(value);
-
-	return rc;
-}
-
-#define OTP_HARD_COLD_REG_ADDR	0x12
-#define OTP_HARD_HOT_REG_ADDR	0x13
-static int smb1360_set_otp_hard_jeita_threshold(struct smb1360_chip *chip,
-				int cold_threshold, int hot_threshold)
-{
-	int rc = 0, i;
-	u8 reg[4] = { 0 };
-	u8 otp_reg = 0;
-	int temp_code;
-
-	if (cold_threshold > chip->cool_bat_decidegc ||
-		chip->cool_bat_decidegc >= chip->warm_bat_decidegc ||
-		chip->warm_bat_decidegc > hot_threshold) {
-		pr_err("cold:%d, cool:%d, warm:%d, hot:%d should be ordered in size\n",
-			cold_threshold, chip->cool_bat_decidegc,
-			chip->warm_bat_decidegc, hot_threshold);
-		return -EINVAL;
-	}
-	pr_debug("cold:%d, cool:%d, warm:%d, hot:%d\n",
-			cold_threshold, chip->cool_bat_decidegc,
-			chip->warm_bat_decidegc, hot_threshold);
-	if (!chip->hard_jeita_otp_reg) {
-		otp_reg = smb1360_alloc_otp_backup_register(chip,
-				ARRAY_SIZE(reg), OTP_BACKUP_FG_USE);
-		if (otp_reg <= 0) {
-			pr_err("OTP reg allocation failed for hard JEITA\n");
-			return otp_reg;
-		}
-
-		chip->hard_jeita_otp_reg = otp_reg;
-	} else {
-		otp_reg = chip->hard_jeita_otp_reg;
-	}
-	pr_debug("hard_jeita_otp_reg = 0x%x\n", chip->hard_jeita_otp_reg);
-
-	reg[0] = (u8)OTP_HARD_HOT_REG_ADDR;
-	temp_code = TEMP_THRE_SET(hot_threshold);
-	if (temp_code < 0) {
-		pr_err("hard hot temp encode failed\n");
-		return temp_code;
-	}
-	reg[1] = (u8)temp_code;
-	reg[2] = (u8)OTP_HARD_COLD_REG_ADDR;
-	temp_code = TEMP_THRE_SET(cold_threshold);
-	if (temp_code < 0) {
-		pr_err("hard cold temp encode failed\n");
-		return temp_code;
-	}
-	reg[3] = (u8)temp_code;
-
-	rc = smb1360_enable_fg_access(chip);
-	if (rc) {
-		pr_err("Couldn't request FG access rc = %d\n", rc);
-		return rc;
-	}
-	chip->fg_access_type = FG_ACCESS_CFG;
-
-	rc = smb1360_select_fg_i2c_address(chip);
-	if (rc) {
-		pr_err("Unable to set FG access I2C address\n");
-		goto restore_fg;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(reg); i++) {
-		rc = smb1360_fg_write(chip, (otp_reg + i), reg[i]);
-		if (rc) {
-			pr_err("Write FG address 0x%x: 0x%x failed, rc = %d\n",
-					otp_reg + i, reg[i], rc);
-			goto restore_fg;
-		}
-		pr_debug("Write FG addr=0x%x, value=0x%x\n",
-					otp_reg + i, reg[i]);
-	}
-	rc = smb1360_otp_backup_alg_update(chip);
-	if (rc) {
-		pr_err("Update OTP backup algorithm failed\n");
-		goto restore_fg;
-	}
-
-	rc = smb1360_masked_write(chip, CFG_FG_BATT_CTRL_REG,
-			CFG_FG_OTP_BACK_UP_ENABLE, CFG_FG_OTP_BACK_UP_ENABLE);
-	if (rc) {
-		pr_err("Write reg 0x0E failed, rc = %d\n", rc);
-		goto restore_fg;
-	}
-
-restore_fg:
-	rc = smb1360_disable_fg_access(chip);
-	if (rc) {
-		pr_err("Couldn't disable FG access rc = %d\n", rc);
-		return rc;
-	}
-
-	return rc;
-}
-
-static int smb1360_hard_jeita_otp_init(struct smb1360_chip *chip)
-{
-	int rc = 0;
-
-	if (!chip->otp_hard_jeita_config)
-		return rc;
-
-	rc = smb1360_set_otp_hard_jeita_threshold(chip,
-		chip->otp_cold_bat_decidegc, chip->otp_hot_bat_decidegc);
-	if (rc) {
-		dev_err(chip->dev,
-			"Couldn't set OTP hard jeita threshold,rc = %d\n", rc);
-		return rc;
 	}
 
 	return rc;
@@ -1937,6 +1833,719 @@ static int smb1360_battery_is_writeable(struct power_supply *psy,
 	return rc;
 }
 
+/*liwei add for lower the charge_current, @20150728, start*/
+#ifdef CHGR_STEADY
+#define BATTERY_CAPACITY_INIT_SHAKING_MAX 20
+#define BATTERY_CAPACITY_RUN_SHAKING_MAX  4
+#define BATTERY_ABS(a,b) ((a)>=(b)?((a)-(b)):((b)-(a)))
+#define BATTERY_MONITOR_LEVEL 0
+#define BATTERY_MONITOR_COUNT (0x1f >> BATTERY_MONITOR_LEVEL)
+
+
+enum BATTERY_ENUM
+{
+	BATTERY_CAPACITY_INIT,
+	BATTERY_CAPACITY_MONITOR,
+};
+#endif
+
+int voltage_capacity_table[][2] = {
+	{4280, 100},
+	{4195, 90},
+	{4100, 80},
+	{4004, 70},
+	{3918, 60},
+	{3844, 50},
+	{3802, 40},
+	{3770, 30},
+	{3739, 20},
+	{3689, 15},
+	{3600, 5},
+	{3370, 0},
+};
+
+int ac_charging_voltage_capacity_table[][2] = {
+	{4330, 100},
+	{4290, 90},
+	{4240, 80},
+	{4164, 70},
+	{4088, 60},
+	{4014, 50},
+	{3972, 40},
+	{3940, 30},
+	{3899, 20},
+	{3849, 15},
+	{3760, 5},
+	{3250, 0},
+};
+
+int usb_charging_voltage_capacity_table[][2] = {
+	{4320, 100},
+	{4240, 90},
+	{4167, 80},
+	{4074, 70},
+	{3988, 60},
+	{3914, 50},
+	{3872, 40},
+	{3840, 30},
+	{3809, 20},
+	{3769, 15},
+	{3700, 5},
+	{3250, 0},
+}; 
+
+static bool hipad_is_usb(struct smb1360_chip *chip)
+{
+	bool is_usb =false;
+	int rc,charge_type = 0;
+	union power_supply_propval prop;
+	if (chip->usb_present)
+	{
+		rc = chip->usb_psy->get_property(chip->usb_psy,
+				POWER_SUPPLY_PROP_TYPE, &prop);
+		if (rc < 0)
+			dev_err(chip->dev,
+					"could not read USB type property, rc=%d\n", rc);
+		else
+			charge_type = prop.intval ;
+		if(charge_type == USB_TYPE)
+			is_usb = true;	
+		else if(charge_type ==AC_TYPE)
+			is_usb = false;
+		return is_usb;
+	}
+	else
+	{
+		return false;
+	}
+}	
+
+static int hipad_vol_to_percent(struct smb1360_chip *chip, int  voltage,int status, int capacity,
+			     int update)
+{
+	int percentum;
+	int temp;
+	int table_size;
+	int pos = 0;
+	static int pre_percentum = 0xffff;
+	//int rc,charge_type = 0;
+	bool  is_usb = hipad_is_usb(chip);
+	static uint8_t read_voltage_delay_time = 0;
+	//union power_supply_propval prop;
+#ifdef DEBUG_CHGMNG
+	static int print_percent_time = 0;
+#endif
+#ifdef CHGR_STEADY
+	static int battery_percentum=0;
+	static enum BATTERY_ENUM battery_status = BATTERY_CAPACITY_INIT;
+	static int	percentum_old=0;
+	static int	percentum_min= 0;
+	static char battery_count=0;
+	static char hipad_battery_full_count=0;
+	static int last_status = 0;
+	static bool percentum_flag = false;
+	battery_count++;
+	battery_count = battery_count & (BATTERY_MONITOR_COUNT >> 1);
+#endif
+	battery_percentum = capacity;
+	if(chip->soc_max == -EINVAL)
+	{
+		battery_status = BATTERY_CAPACITY_MONITOR;
+	}
+
+	if(last_status != status)
+	{
+		read_voltage_delay_time = 0;
+		last_status = status;
+	}
+	
+      	//pr_log("voltage=%d,capacity=%d,status=%d,is_usb=%d,bat_full=%d\n",voltage,capacity,status,is_usb,chip->batt_full);
+	if (update) {
+		pre_percentum = 0xffff;
+		return 0;
+	}
+
+	if (status)
+	{
+		if(chip->batt_full)
+		{
+			percentum = percentum_old = pre_percentum = 100;
+		}
+		else
+		{
+		 if (is_usb) {
+			table_size =
+				ARRAY_SIZE(usb_charging_voltage_capacity_table);
+			for (pos = table_size - 1; pos > 0; pos--) {
+				if (voltage <
+						usb_charging_voltage_capacity_table[pos][0])
+					break;
+			}
+			if (pos == table_size - 1) {
+				percentum = 0;
+			} else {
+				temp =
+					usb_charging_voltage_capacity_table[pos][1]
+					- usb_charging_voltage_capacity_table[pos +
+					1][1];
+				temp =
+					temp * (voltage -
+							usb_charging_voltage_capacity_table
+							[pos][0]);
+				temp =
+					temp /
+					(usb_charging_voltage_capacity_table[pos][0]
+					 - usb_charging_voltage_capacity_table[pos +
+					 1]
+					 [0]);
+				temp =
+					temp +
+					usb_charging_voltage_capacity_table[pos][1];
+				if (temp > 100)
+					temp = 100;
+				percentum = temp;
+	
+			}
+		} else {
+			table_size =
+				ARRAY_SIZE(ac_charging_voltage_capacity_table);
+			for (pos = table_size - 1; pos > 0; pos--) {
+				if (voltage <
+						ac_charging_voltage_capacity_table[pos][0])
+					break;
+			}
+			if (pos == table_size - 1) {
+				percentum = 0;
+			} else {
+				temp =
+					ac_charging_voltage_capacity_table[pos][1] -
+					ac_charging_voltage_capacity_table[pos +
+					1][1];
+				temp =
+					temp * (voltage -
+							ac_charging_voltage_capacity_table
+							[pos][0]);
+				temp =
+					temp /
+					(ac_charging_voltage_capacity_table[pos][0]
+					 - ac_charging_voltage_capacity_table[pos +
+					 1]
+					 [0]);
+				temp =
+					temp +
+					ac_charging_voltage_capacity_table[pos][1];
+				if (temp > 100)
+					temp = 100;
+				percentum = temp;
+			}
+		}
+
+		if (pre_percentum == 0xffff)
+			pre_percentum = percentum;
+		else if (pre_percentum > percentum) {
+			percentum = pre_percentum;
+			read_voltage_delay_time = 0;
+		}
+		else if(pre_percentum <= percentum)
+		{
+			//CHGMNG_PRINT("read_voltage_delay_time = %d\r\n",  read_voltage_delay_time);
+			/*We must wait at least READ_DELAY_NUM when percentum changes over BATTERY_PERNUM_OFFSET,Sept 04th,2013. */
+			if(((percentum - pre_percentum) > BATTERY_PERNUM_OFFSET) && (read_voltage_delay_time < READ_DELAY_NUM))
+			{
+				percentum = pre_percentum;
+				read_voltage_delay_time ++;
+			}
+			else
+			{
+				pre_percentum = percentum;
+				read_voltage_delay_time = 0;
+			}
+		}
+		else
+		{
+			//do nothing
+		}
+	}
+		//CHGMNG_PRINT("%s[%d]:percentum=%d,pre_percentum=%d\r\n",__FUNCTION__,__LINE__,percentum,pre_percentum);
+   } else {
+	
+				table_size = ARRAY_SIZE(voltage_capacity_table);
+			for (pos = 0; pos < table_size - 1; pos++) {
+				if (voltage > voltage_capacity_table[pos][0])
+					break;
+			}
+			if (pos == 0) {
+				percentum = 100;
+			} else {
+				temp =
+					voltage_capacity_table[pos][1] -
+					voltage_capacity_table[pos - 1][1];
+				temp =
+					temp * (voltage - voltage_capacity_table[pos][0]);
+				temp =
+					temp / (voltage_capacity_table[pos][0] -
+							voltage_capacity_table[pos - 1][0]);
+				temp = temp + voltage_capacity_table[pos][1];
+				if (temp < 0)
+					temp = 0;
+				percentum = temp;
+			}
+			if (pre_percentum == 0xffff)
+				pre_percentum = percentum;
+			else if (pre_percentum < percentum)
+			{
+				
+				if(percentum_flag)
+				{
+					percentum_flag = false;
+					read_voltage_delay_time = 0;
+				}
+				
+				if(read_voltage_delay_time < READ_DELAY_NUM)
+				{
+					percentum = pre_percentum;
+					read_voltage_delay_time ++;
+				}
+				else
+				{
+					pre_percentum = percentum;
+					read_voltage_delay_time = 0;
+				}
+			}
+			else if (pre_percentum >= percentum) {
+			/*We must wait at least READ_DELAY_NUM when percentum changes over BATTERY_PERNUM_OFFSET,Sept 04th,2013. */
+				if(!percentum_flag)
+				{
+					percentum_flag = true;
+					read_voltage_delay_time = 0;
+				}
+				
+				if(((pre_percentum - percentum) > BATTERY_DECREASE_PERNUM_OFFSET) || (percentum > battery_percentum))
+				{
+					if(read_voltage_delay_time >=  READ_DELAY_NUM)
+					{
+						pre_percentum= percentum;
+						read_voltage_delay_time = 0;
+					}
+					else
+					{
+						percentum = pre_percentum;
+						read_voltage_delay_time ++;
+					}
+				}
+				else
+				{
+					pre_percentum= percentum;
+					read_voltage_delay_time = 0;
+				}
+			}
+			else
+			{
+				//do nothing
+			}	
+		
+	}
+#ifdef CHGR_STEADY
+	switch(battery_status)
+	{
+	case BATTERY_CAPACITY_INIT:
+		//capcity_reference=get_battery_reference();
+		pr_log("capcity_reference=%d,percentum=%d\n",chip->capcity_reference,percentum);
+			percentum_old = percentum;
+			battery_status=BATTERY_CAPACITY_MONITOR;
+			if(percentum<=5)
+			{
+				battery_percentum = percentum;
+				return  battery_percentum;
+			}
+			
+			if(chip->capcity_reference == 100)
+			{	
+				battery_percentum = percentum;
+			}
+			else if((chip->capcity_reference != 85) &&(chip->capcity_reference != 0) )
+			{
+				
+				if(chip->capcity_reference == 99)
+				{
+					chip->capcity_reference = 100;
+				}
+				battery_percentum = chip->capcity_reference;
+			
+			}
+			else
+			{
+					battery_percentum=percentum;
+			}
+			percentum_min = battery_percentum;
+			
+	break;
+	case BATTERY_CAPACITY_MONITOR:
+			{
+				//pr_log("percentum_old=%d,percentum=%d,battery_percentum=%d,battery_count=%d\n",percentum_old,percentum,battery_percentum,battery_count);
+				if( BATTERY_ABS(percentum, percentum_old) <= BATTERY_CAPACITY_RUN_SHAKING_MAX)
+				{
+					if(status)
+					{
+				
+						if(chip->batt_full && (battery_percentum < 100))
+						{
+							if((battery_count & (BATTERY_MONITOR_COUNT  >> 2))== 0)
+							{
+								battery_percentum++;
+								battery_count = 0;
+							}
+						}
+						else
+						{
+							if(battery_percentum < percentum)
+							{
+								if((percentum  >= (battery_percentum + HIPAD_CAPACITY_THRESHOLD)))
+								{
+									if((battery_count & (BATTERY_MONITOR_COUNT >> 3))== 0)
+									{
+										battery_percentum++;
+										battery_count = 0;
+									}
+								}
+								else if(percentum > 90)
+								{
+									if((battery_count & BATTERY_MONITOR_COUNT )== 0)
+									{
+										battery_percentum++;
+										battery_count = 0;
+									}
+								}
+								else
+								{
+									if(battery_count == 0)
+										battery_percentum++;
+								}
+							}
+							else	if(battery_percentum > percentum)
+							{
+							}
+							else
+							{
+								battery_count=0;
+							}
+
+							if(!chip->batt_full && (battery_percentum == 100) && (capacity != 100))
+							{
+								if(hipad_battery_full_count >= HIPAD_BATTERY_FULL_THRESHOLD)
+								{
+									battery_percentum = 100;		
+									//hipad_battery_full_count = 0;
+								}
+								else
+								{
+									battery_percentum = 99;	
+									hipad_battery_full_count++;
+								}
+							}
+					   }	
+  						percentum_min = battery_percentum;
+					}
+					else
+					{
+						if(battery_percentum > percentum)
+						{
+							if (percentum <=10)
+							{
+								if((battery_count & (BATTERY_MONITOR_COUNT >> 4))== 0)
+								{
+									battery_percentum--;
+									battery_count = 0;
+								}
+							}
+							/* else if ( battery_percentum  >= (percentum + 7))
+							{
+								if((battery_count & (BATTERY_MONITOR_COUNT >> 3))== 0)
+								{
+									battery_percentum--;
+								}
+							} */
+							else
+							{
+								if((battery_count & (BATTERY_MONITOR_COUNT >> 2))== 0)
+								{
+									battery_percentum--;
+									battery_count = 0;
+								}
+							}
+
+						}
+						else if (battery_percentum < percentum)
+						{
+							if((percentum  >= (battery_percentum + 4)) && (percentum_old > percentum) && (percentum_min > percentum))
+							{
+								if(battery_percentum > 1)
+								{
+									battery_percentum--;
+									percentum_min = percentum;
+								}
+							}
+						}
+						else
+						{
+							battery_count=0;
+						}
+						hipad_battery_full_count = 0;
+					
+					}
+				}
+				else
+				{
+				}
+				percentum_old = percentum;
+			}
+			break;
+	}
+#endif
+	/*Printted battery charging information by liwei, Sept 04th,2013.*/
+#ifdef DEBUG_CHGMNG
+	print_percent_time ++;
+	print_percent_time %= VBAT_CAPACITY_BUFF_CNT;
+	if(0 == print_percent_time)
+	{
+		printk("%s[%d]:is_charging=%d,voltage=%d,battery_percentum=%d\r\n",
+				__FUNCTION__,__LINE__,status,voltage,battery_percentum);
+	}
+#endif
+#ifdef CHGR_STEADY
+	return battery_percentum;
+#else
+	return percentum;
+#endif
+}
+static void hipad_adjust_charging_soc_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct smb1360_chip *chip = container_of(dwork,
+				struct smb1360_chip, adjust_charging_soc_work);
+//	ktime_t kt;
+	static int work_count =0;
+	int last_capacity = chip->hipad_capacity;
+	int hipad_voltage;
+	int hipad_current;
+	int status;
+	int voltage_offset =0;
+	int pre_lock_enable = atomic_read(&chip->hipad_lock_enable);
+	//pr_log("usb_present=%d,pre_lock_enable=%d\n",chip->usb_present,pre_lock_enable);
+	if(chip->usb_present)
+	{
+		if(pre_lock_enable == 0)
+		{
+			//pr_log("start lock\n");
+			wake_lock(&hipad_chg_wake_lock);
+			atomic_set(&chip->hipad_lock_enable, 1);
+		}
+	}
+	else
+	{
+		if(pre_lock_enable == 1)
+		{
+			//pr_log("start unlock\n");
+			wake_unlock(&hipad_chg_wake_lock);
+			atomic_set(&chip->hipad_lock_enable, 0);
+		}
+	}
+	
+	if (!is_device_suspended(chip))
+	{
+		 if((chip->soc_max != -EINVAL) && (work_count  < WORK_THRESHOLD) )
+	 	{
+	 		hipad_voltage = chip->hipad_voltage_first ;
+			work_count ++;
+	 	}
+		 else
+	 	{
+	 		hipad_voltage = smb1360_get_prop_voltage_now(chip) / 1000;
+			hipad_current = smb1360_get_prop_current_now(chip)/1000;
+			//pr_log("hipad_voltage=%d,current_now=%d\n",hipad_voltage,hipad_current);
+			if(!chip->usb_present)
+			{
+				voltage_offset = DIV_ROUND_CLOSEST(hipad_current,100) *11;
+			}  
+			else
+			{
+				voltage_offset = 0 ;
+			}  
+
+			hipad_voltage = hipad_voltage + voltage_offset;			
+	 	}
+		status = smb1360_get_prop_charging_status(chip);			
+		chip->hipad_capacity = hipad_vol_to_percent(chip,hipad_voltage,status,last_capacity,0);
+	}	
+
+	if(last_capacity != chip->hipad_capacity)
+	{		
+		power_supply_changed(&chip->batt_psy);	
+	}	
+	
+	#if 0
+	 if((work_count  >= WORK_THRESHOLD) && (chip->usb_present))
+	{
+		kt = ns_to_ktime(POWER_STAGE_REDUCE_CHECK_PERIOD_NS);
+		pr_log("start alarm\n");
+		alarm_start_relative(&chip->battery_alarm, kt);
+	}
+	else
+	{ 
+		if(work_count  <  WORK_THRESHOLD)work_count ++;
+	#endif	
+	if(chip->usb_present)
+	{
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));	
+	}
+	else
+	{
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_DISCHARGE_MS));
+	}
+	
+
+}
+
+#if 0
+static void hipad_charging_soc_work(struct work_struct *work)
+{
+	struct smb1360_chip *chip = container_of(work,
+				struct smb1360_chip, hipad_soc_work);
+	ktime_t kt;
+	int last_capacity = chip->hipad_capacity;
+	int hipad_voltage;
+	int status;
+	
+	if (!is_device_suspended(chip))
+	{
+		hipad_voltage = smb1360_get_prop_voltage_now(chip) / 1000;
+		status = smb1360_get_prop_charging_status(chip);	
+		chip->hipad_capacity = hipad_vol_to_percent(chip,hipad_voltage,status,last_capacity,0);
+	}
+
+	if(last_capacity != chip->hipad_capacity)
+	{		
+		power_supply_changed(&chip->batt_psy);	
+	}	
+
+	if(chip->usb_present)
+	{
+		kt = ns_to_ktime(POWER_STAGE_REDUCE_CHECK_PERIOD_NS);
+		pr_log("start alarm also\n");
+		alarm_start_relative(&chip->battery_alarm, kt);
+	}
+	else
+	{
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));	
+	}
+	
+}
+
+static enum alarmtimer_restart 
+hipad_battery_update_callback(struct alarm *alarm, ktime_t now)
+{
+	struct smb1360_chip *chip = container_of(alarm,struct smb1360_chip,battery_alarm);
+
+	//schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_ALARM_MS));	
+	schedule_work(&chip->hipad_soc_work);
+	return ALARMTIMER_NORESTART;
+}
+#endif
+#ifdef CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+static void hipad_adjust_charging_current_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct smb1360_chip *chip = container_of(dwork,
+				struct smb1360_chip, adjust_charging_current_work);
+	static bool is_warm =false;
+	int status;
+	int temp;  
+	int capacity;
+	static int check_hot_temp_count=0;
+	static int check_cool_temp_count =0;
+
+	status = smb1360_get_prop_charging_status(chip);
+	temp = smb1360_get_prop_batt_temp(chip);
+	capacity = smb1360_get_prop_batt_capacity(chip);
+	if( chip->usb_present && is_warm  && !chip->hipad_usb_present && (temp < (chip->hipad_warm_bat_decidegc - HIPAD_DELTA_TEMP)))
+	{
+		is_warm = false;
+		chip->hipad_usb_present = true;
+		smb1360_system_temp_level_set(chip,0);		
+	}
+	if( chip->usb_present && (temp >= chip->hipad_warm_bat_decidegc) && status  )
+	{
+		if(is_warm)
+		{
+			schedule_delayed_work(&chip->adjust_charging_current_work,
+				msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));
+			return;
+		}
+			
+		if(check_hot_temp_count < SAMPLE_TEMP_COUNT)
+		{
+			check_hot_temp_count ++;
+		}
+		else
+		{
+			check_hot_temp_count =0;
+		}
+		
+		if(check_hot_temp_count == SAMPLE_TEMP_COUNT)
+		{
+			smb1360_system_temp_level_set(chip,1);
+			is_warm = true;
+			check_hot_temp_count =0;
+		}
+		check_cool_temp_count = 0;
+					
+	}
+	else  
+	{
+		if(chip->usb_present && (temp < (chip->hipad_warm_bat_decidegc - HIPAD_DELTA_TEMP)) )
+		{
+			if(check_cool_temp_count < SAMPLE_TEMP_COUNT)
+			{
+				check_cool_temp_count ++;
+			}
+			else
+			{
+				check_cool_temp_count =0;
+			}
+			
+		}
+		else
+		{
+			check_cool_temp_count =0;
+		}
+
+		if( is_warm  &&( (!chip->usb_present)  || (check_cool_temp_count == SAMPLE_TEMP_COUNT))) // || (status != POWER_SUPPLY_STATUS_CHARGING) ))
+		{
+			is_warm = false;
+			smb1360_system_temp_level_set(chip,0);			
+		}
+		check_hot_temp_count = 0;
+	}
+
+	if(chip->usb_present)
+	{
+		schedule_delayed_work(&chip->adjust_charging_current_work,
+			msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));	
+		if(!chip->hipad_usb_present)
+		{
+			chip->hipad_usb_present = true;
+		}
+	}
+	else
+	{
+		is_warm = false;
+		check_cool_temp_count = 0;
+		check_hot_temp_count = 0;		
+	}
+}
+#endif
+/*liwei add for lower the charge_current, @20150728, end*/
+
 static int smb1360_battery_get_property(struct power_supply *psy,
 				       enum power_supply_property prop,
 				       union power_supply_propval *val)
@@ -1955,7 +2564,7 @@ static int smb1360_battery_get_property(struct power_supply *psy,
 		val->intval = smb1360_get_prop_batt_status(chip);
 		break;
 	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
-		val->intval = !chip->charging_disabled_status;
+		val->intval = smb1360_get_prop_charging_status(chip);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = smb1360_get_prop_charge_type(chip);
@@ -2035,6 +2644,7 @@ static void smb1360_external_power_changed(struct power_supply *psy)
 static int hot_hard_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
+	pr_log("rt_stat = 0x%02x\n", rt_stat);
 	chip->batt_hot = !!rt_stat;
 
 	if (chip->parallel_charging) {
@@ -2043,11 +2653,6 @@ static int hot_hard_handler(struct smb1360_chip *chip, u8 rt_stat)
 		smb1360_parallel_charger_enable(chip,
 				PARALLEL_JEITA_HARD, !chip->batt_hot);
 	}
-	if (chip->hot_hysteresis) {
-		smb1360_stay_awake(&chip->smb1360_ws,
-			WAKEUP_SRC_JEITA_HYSTERSIS);
-		schedule_work(&chip->jeita_hysteresis_work);
-	}
 
 	return 0;
 }
@@ -2055,6 +2660,7 @@ static int hot_hard_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int cold_hard_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
+	pr_log("rt_stat = 0x%02x\n", rt_stat);
 	chip->batt_cold = !!rt_stat;
 
 	if (chip->parallel_charging) {
@@ -2063,50 +2669,8 @@ static int cold_hard_handler(struct smb1360_chip *chip, u8 rt_stat)
 		smb1360_parallel_charger_enable(chip,
 				PARALLEL_JEITA_HARD, !chip->batt_cold);
 	}
-	if (chip->cold_hysteresis) {
-		smb1360_stay_awake(&chip->smb1360_ws,
-			WAKEUP_SRC_JEITA_HYSTERSIS);
-		schedule_work(&chip->jeita_hysteresis_work);
-	}
 
 	return 0;
-}
-
-static void smb1360_jeita_hysteresis_work(struct work_struct *work)
-{
-	int rc = 0;
-	int hard_hot, hard_cold;
-	struct smb1360_chip *chip = container_of(work,
-			struct smb1360_chip, jeita_hysteresis_work);
-
-	/* disable hard JEITA IRQ first */
-	rc = smb1360_masked_write(chip, IRQ_CFG_REG,
-			IRQ_BAT_HOT_COLD_HARD_BIT, 0);
-	if (rc) {
-		pr_err("disable hard JEITA IRQ failed, rc = %d\n", rc);
-		goto exit_worker;
-	}
-	hard_hot = chip->otp_hot_bat_decidegc;
-	hard_cold = chip->otp_cold_bat_decidegc;
-	if (chip->batt_hot)
-		hard_hot -= chip->hot_hysteresis;
-	else if (chip->batt_cold)
-		hard_cold += chip->cold_hysteresis;
-
-	rc = smb1360_set_otp_hard_jeita_threshold(chip, hard_cold, hard_hot);
-	if (rc) {
-		pr_err("set hard JEITA threshold failed\n");
-		goto exit_worker;
-	}
-	pr_debug("hard cold: %d, hard hot: %d reprogramed\n",
-					hard_cold, hard_hot);
-	/* enable hard JEITA IRQ at the end */
-	rc = smb1360_masked_write(chip, IRQ_CFG_REG,
-		IRQ_BAT_HOT_COLD_HARD_BIT, IRQ_BAT_HOT_COLD_HARD_BIT);
-	if (rc)
-		pr_err("enable hard JEITA IRQ failed\n");
-exit_worker:
-	smb1360_relax(&chip->smb1360_ws, WAKEUP_SRC_JEITA_HYSTERSIS);
 }
 
 /*
@@ -2124,7 +2688,12 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 	struct smb1360_chip *chip = container_of(dwork, struct smb1360_chip,
 							jeita_work);
 	temp = smb1360_get_prop_batt_temp(chip);
-
+	/*liwei add for adjusting temp when temp lower than -12c,start,20150807*/
+	//if( temp  <= (HIPAD_HIGH_TEMP_THRESHOLD -20))		
+	//{
+		temp  +=HIPAD_TEMP_COMPENSATION;
+	//}  
+	/*liwei add for adjusting temp when temp lower than -12c,end,20150807*/
 	if (temp > chip->hot_bat_decidegc) {
 		/* battery status is hot, only config thresholds */
 		rc = smb1360_set_soft_jeita_threshold(chip,
@@ -2180,6 +2749,11 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 			dev_err(chip->dev, "Couldn't set float voltage\n");
 			goto end;
 		}
+		/*liwei add for adjusting charging current  when temp lower than 0c,start,20150806 */
+		rc = smb1360_set_appropriate_usb_current(chip);
+		if (rc)
+			pr_err("Couldn't set USB current\n");
+		/*liwei add for adjusting charging current when temp lower than 0c,end,20150806 */
 		rc = smb1360_set_soft_jeita_threshold(chip,
 			chip->cold_bat_decidegc, chip->cool_bat_decidegc);
 		if (rc) {
@@ -2201,13 +2775,57 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 		!!chip->soft_hot_rt_stat, chip->soft_jeita_supported,
 		chip->soft_cold_thresh, chip->soft_hot_thresh);
 end:
-	smb1360_relax(&chip->smb1360_ws, WAKEUP_SRC_JEITA_SOFT);
+	pm_relax(chip->dev);
 }
+
+/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+#define HIPAD_TEMP_CHECK_PERIOD_MS	30000
+static void smb1360_temp_check_work(struct work_struct *work)
+{
+	int temp;
+	int smb1360_charging;
+	int rc = 0;
+	
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct smb1360_chip *chip = container_of(dwork, struct smb1360_chip,
+							temp_check_work);
+	
+	temp = smb1360_get_prop_batt_temp(chip);
+	smb1360_charging = smb1360_get_prop_charging_status(chip);
+
+	if(!chip->usb_present)
+		return ;
+
+	if (temp >= chip->hipad_cold_bat_decidegc && temp <= chip->hipad_hot_bat_decidegc) {
+		if (smb1360_charging == false) {
+			rc = smb1360_charging_disable(chip, USER, false);
+			if (rc) {
+				dev_err(chip->dev, "Battery's Temperature is good, but couldn't 'enable' charging rc = %d\n", rc);
+			} else {
+				dev_info(chip->dev, "Battery's temperature is %d, so start charging!\n", temp);
+			}
+		}
+	} else {
+		if (smb1360_charging == true) {
+			rc = smb1360_charging_disable(chip, USER, true);
+			if (rc) {
+				dev_err(chip->dev, "Battery's Temperature is bad, but couldn't 'disable' charging rc = %d\n", rc);
+			} else {
+				dev_info(chip->dev, "Battery's temperature is %d, so stop charging!\n", temp);
+			}
+		}
+	}
+	schedule_delayed_work(&chip->temp_check_work, msecs_to_jiffies(HIPAD_TEMP_CHECK_PERIOD_MS));
+}
+#endif
+/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
 
 static int hot_soft_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	chip->soft_hot_rt_stat = rt_stat;
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
+	pr_log("rt_stat = 0x%02x\n",rt_stat);
 	if (!chip->config_hard_thresholds)
 		chip->batt_warm = !!rt_stat;
 
@@ -2215,8 +2833,7 @@ static int hot_soft_handler(struct smb1360_chip *chip, u8 rt_stat)
 		cancel_delayed_work_sync(&chip->jeita_work);
 		schedule_delayed_work(&chip->jeita_work,
 					msecs_to_jiffies(JEITA_WORK_MS));
-		smb1360_stay_awake(&chip->smb1360_ws,
-			WAKEUP_SRC_JEITA_SOFT);
+		pm_stay_awake(chip->dev);
 	}
 
 	if (chip->parallel_charging) {
@@ -2232,6 +2849,7 @@ static int cold_soft_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	chip->soft_cold_rt_stat = rt_stat;
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
+	pr_log("rt_stat = 0x%02x\n",rt_stat);
 	if (!chip->config_hard_thresholds)
 		chip->batt_cool = !!rt_stat;
 
@@ -2239,8 +2857,7 @@ static int cold_soft_handler(struct smb1360_chip *chip, u8 rt_stat)
 		cancel_delayed_work_sync(&chip->jeita_work);
 		schedule_delayed_work(&chip->jeita_work,
 					msecs_to_jiffies(JEITA_WORK_MS));
-		smb1360_stay_awake(&chip->smb1360_ws,
-			WAKEUP_SRC_JEITA_SOFT);
+		pm_stay_awake(chip->dev);
 	}
 
 	if (chip->parallel_charging) {
@@ -2263,6 +2880,7 @@ static int battery_missing_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int vbat_low_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("vbat low\n");
+	pr_log("vbat low\n");
 
 	return 0;
 }
@@ -2270,14 +2888,33 @@ static int vbat_low_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int chg_hot_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_warn_ratelimited("chg hot\n");
+	pr_log("rt_stat=%d\n",rt_stat);
 	return 0;
 }
 
 static int chg_term_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
+	if(rt_stat != 0)		//zhangjiyou add for bug:74650, @20150901
+		pr_log("rt_stat = 0x%02x\n",rt_stat);
 	chip->batt_full = !!rt_stat;
-
+       if(chip->usb_present && !chip->batt_full &&  !chip->use_voltage && (chip->soc_now < 100) )
+   	{
+   		if(chip->term_count >= HIPAD_TERM_THRESHOLD)
+		{	chip->use_voltage = true;
+			chip->hipad_capacity = chip->soc_now;
+			schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));	
+   		}
+		else
+		{
+			chip->term_count ++;
+		}
+	}
+	else
+	{
+		chip->term_count = 0;
+	}
+	   	
 	if (chip->parallel_charging) {
 		pr_debug("%s parallel-charging\n", chip->batt_full ?
 					"Disable" : "Enable");
@@ -2291,7 +2928,7 @@ static int chg_term_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int chg_fastchg_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
-
+	//pr_log("rt_stat = 0x%02x\n", rt_stat); //zhangjiyou delete for bug:74650, @20150901
 	return 0;
 }
 
@@ -2301,9 +2938,18 @@ static int usbin_uv_handler(struct smb1360_chip *chip, u8 rt_stat)
 
 	pr_debug("chip->usb_present = %d usb_present = %d\n",
 				chip->usb_present, usb_present);
+    pr_log("chip->usb_present = %d usb_present = %d\n",
+				chip->usb_present, usb_present);
 	if (chip->usb_present && !usb_present) {
 		/* USB removed */
 		chip->usb_present = usb_present;
+		
+		/*liwei add for lower the charge_current, @20150728, start*/
+		#ifdef CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+		chip->hipad_usb_present = false;
+		#endif
+		/*liwei add for lower the charge_current, @20150728, end*/
+
 		power_supply_set_present(chip->usb_psy, usb_present);
 	}
 
@@ -2311,11 +2957,41 @@ static int usbin_uv_handler(struct smb1360_chip *chip, u8 rt_stat)
 		/* USB inserted */
 		chip->usb_present = usb_present;
 		power_supply_set_present(chip->usb_psy, usb_present);
-	}
 
-	return 0;
+		/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+		#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+		cancel_delayed_work_sync(&chip->temp_check_work);
+		schedule_delayed_work(&chip->temp_check_work, msecs_to_jiffies(HIPAD_TEMP_CHECK_PERIOD_MS));
+		#endif
+		/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
+		
+		/*liwei add for lower the charge_current, @20150728, start*/
+		#ifdef CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+		cancel_delayed_work_sync(&chip->adjust_charging_current_work);
+		schedule_delayed_work(&chip->adjust_charging_current_work,
+			msecs_to_jiffies(TEMP_CHECK_PERIOD_START_MS));
+		#endif
+		/*liwei add for lower the charge_current, @20150728, start*/
+
+	}
+    return 0;
 }
 
+/*charger voltage higher than 6.5 V,then trigger this interrupt and stop charging.And set charger_overvoltage as true,liwei add 20150730,start*/
+static int usbin_ov_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_log("USB overvoltage %d\n",rt_stat);
+	chip->charger_overvoltage = !!rt_stat;
+	return 0;
+}
+/*charger voltage higher than 6.5 V,then trigger this interrupt and stop charging.And set charger_overvoltage as true,liwei add 20150730,end*/
+/*liwei add for debug 20150803,start*/
+static int saftety_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_log("saftety_handler %d\n",rt_stat);
+	return 0;
+}
+/*liwei add for debug 20150803,end*/
 static int aicl_done_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	bool aicl_done = !!rt_stat;
@@ -2324,7 +3000,7 @@ static int aicl_done_handler(struct smb1360_chip *chip, u8 rt_stat)
 
 	if (chip->parallel_charging && aicl_done) {
 		cancel_work_sync(&chip->parallel_work);
-		smb1360_stay_awake(&chip->smb1360_ws, WAKEUP_SRC_PARALLEL);
+		pm_stay_awake(chip->dev);
 		schedule_work(&chip->parallel_work);
 	}
 
@@ -2339,6 +3015,7 @@ static int chg_inhibit_handler(struct smb1360_chip *chip, u8 rt_stat)
 	 * battery full
 	 */
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
+	pr_log("rt_stat = 0x%02x\n",rt_stat);
 	chip->batt_full = !!rt_stat;
 	return 0;
 }
@@ -2346,19 +3023,24 @@ static int chg_inhibit_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int delta_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("SOC changed! - rt_stat = 0x%02x\n", rt_stat);
+	//pr_log("SOC changed! - rt_stat = 0x%02x\n", rt_stat);
 
 	return 0;
 }
 
+/*liwei add for debug 20150803,start*/
+static int chg_error_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_log("SOC changed! - rt_stat = 0x%02x\n", rt_stat);
+	return 0;
+}
+/*liwei add for debug 20150803,end*/
 static int min_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("SOC dropped below min SOC, rt_stat = 0x%02x\n", rt_stat);
 
 	if (chip->awake_min_soc)
-		rt_stat ? smb1360_stay_awake(&chip->smb1360_ws,
-				WAKEUP_SRC_MIN_SOC) :
-			smb1360_relax(&chip->smb1360_ws,
-				WAKEUP_SRC_MIN_SOC);
+		rt_stat ? pm_stay_awake(chip->dev) : pm_relax(chip->dev);
 
 	return 0;
 }
@@ -2370,13 +3052,11 @@ static int empty_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 	if (!chip->empty_soc_disabled) {
 		if (rt_stat) {
 			chip->empty_soc = true;
-			smb1360_stay_awake(&chip->smb1360_ws,
-				WAKEUP_SRC_EMPTY_SOC);
+			pm_stay_awake(chip->dev);
 			pr_warn_ratelimited("SOC is 0\n");
 		} else {
 			chip->empty_soc = false;
-			smb1360_relax(&chip->smb1360_ws,
-				WAKEUP_SRC_EMPTY_SOC);
+			pm_relax(chip->dev);
 		}
 	}
 
@@ -2386,7 +3066,10 @@ static int empty_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int full_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	if (rt_stat)
+	{
 		pr_debug("SOC is 100\n");
+		pr_log("SOC is 100\n");
+	}
 
 	return 0;
 }
@@ -2411,68 +3094,99 @@ static int batt_id_complete_handler(struct smb1360_chip *chip, u8 rt_stat)
 	return 0;
 }
 
+static int smb1360_select_fg_i2c_address(struct smb1360_chip *chip)
+{
+	unsigned short addr = chip->default_i2c_addr << 0x1;
+
+	switch (chip->fg_access_type) {
+	case FG_ACCESS_CFG:
+		addr = (addr & ~FG_I2C_CFG_MASK) | FG_CFG_I2C_ADDR;
+		break;
+	case FG_ACCESS_PROFILE_A:
+		addr = (addr & ~FG_I2C_CFG_MASK) | FG_PROFILE_A_ADDR;
+		break;
+	case FG_ACCESS_PROFILE_B:
+		addr = (addr & ~FG_I2C_CFG_MASK) | FG_PROFILE_B_ADDR;
+		break;
+	default:
+		pr_err("Invalid FG access type=%d\n", chip->fg_access_type);
+		return -EINVAL;
+	}
+
+	chip->fg_i2c_addr = addr >> 0x1;
+	pr_debug("FG_access_type=%d fg_i2c_addr=%x\n", chip->fg_access_type,
+							chip->fg_i2c_addr);
+
+	return 0;
+}
+
 static int smb1360_adjust_current_gain(struct smb1360_chip *chip,
-						int gain_factor)
+							int gain_factor)
 {
 	int i, rc;
 	int64_t current_gain, new_current_gain;
+	u8 reg[2];
 	u16 reg_value1 = 0, reg_value2 = 0;
-	u8 reg[4] = {0x1D, 0x00, 0x1E, 0x00};
-	u8 otp_reg = 0;
-
-	if (!chip->current_gain_otp_reg) {
-		otp_reg = smb1360_alloc_otp_backup_register(chip,
-				ARRAY_SIZE(reg), OTP_BACKUP_FG_USE);
-		if (otp_reg <= 0) {
-			pr_err("OTP reg allocation fail for adjusting current gain\n");
-			return otp_reg;
-		} else {
-			chip->current_gain_otp_reg = otp_reg;
-		}
-	} else {
-		otp_reg = chip->current_gain_otp_reg;
-	}
-	pr_debug("current_gain_otp_reg = 0x%x\n", chip->current_gain_otp_reg);
+	u8 reg_val_mapping[][2] = {
+			{0xE0, 0x1D},
+			{0xE1, 0x00},
+			{0xE2, 0x1E},
+			{0xE3, 0x00},
+			{0xE4, 0x00},
+			{0xE5, 0x00},
+			{0xE6, 0x00},
+			{0xE7, 0x00},
+			{0xE8, 0x00},
+			{0xE9, 0x00},
+			{0xEA, 0x00},
+			{0xEB, 0x00},
+			{0xEC, 0x00},
+			{0xED, 0x00},
+			{0xEF, 0x00},
+			{0xF0, 0x50},
+			{0xF1, 0x00},
+	};
 
 	if (gain_factor) {
-		rc = smb1360_fg_read(chip, CURRENT_GAIN_LSB_REG, &reg[1]);
+		rc = smb1360_fg_read(chip, CURRENT_GAIN_LSB_REG, &reg[0]);
 		if (rc) {
 			pr_err("Unable to set FG access I2C address rc=%d\n",
 									rc);
 			return rc;
 		}
 
-		rc = smb1360_fg_read(chip, CURRENT_GAIN_MSB_REG, &reg[3]);
+		rc = smb1360_fg_read(chip, CURRENT_GAIN_MSB_REG, &reg[1]);
 		if (rc) {
 			pr_err("Unable to set FG access I2C address rc=%d\n",
 									rc);
 			return rc;
 		}
 
-		reg_value1 = (reg[3] << 8) | reg[1];
+		reg_value1 = (reg[1] << 8) | reg[0];
 		current_gain = float_decode(reg_value1);
 		new_current_gain = MICRO_UNIT  + (gain_factor * current_gain);
 		reg_value2 = float_encode(new_current_gain);
-		reg[1] = reg_value2 & 0xFF;
-		reg[3] = (reg_value2 & 0xFF00) >> 8;
+		reg[0] = reg_value2 & 0xFF;
+		reg[1] = (reg_value2 & 0xFF00) >> 8;
 		pr_debug("current_gain_reg=0x%x current_gain_decoded=%lld new_current_gain_decoded=%lld new_current_gain_reg=0x%x\n",
 			reg_value1, current_gain, new_current_gain, reg_value2);
 
-		for (i = 0; i < ARRAY_SIZE(reg); i++) {
-			pr_debug("Writing reg_add=%x value=%x\n",
-					otp_reg + i, reg[i]);
+		for (i = 0; i < ARRAY_SIZE(reg_val_mapping); i++) {
+			if (reg_val_mapping[i][0] == 0xE1)
+				reg_val_mapping[i][1] = reg[0];
+			if (reg_val_mapping[i][0] == 0xE3)
+				reg_val_mapping[i][1] = reg[1];
 
-			rc = smb1360_fg_write(chip, (otp_reg + i), reg[i]);
+			pr_debug("Writing reg_add=%x value=%x\n",
+				reg_val_mapping[i][0], reg_val_mapping[i][1]);
+
+			rc = smb1360_fg_write(chip, reg_val_mapping[i][0],
+					reg_val_mapping[i][1]);
 			if (rc) {
-				pr_err("Write FG address 0x%x failed, rc = %d\n",
-							otp_reg + i, rc);
+				pr_err("Write fg address 0x%x failed, rc = %d\n",
+						reg_val_mapping[i][0], rc);
 				return rc;
 			}
-		}
-		rc = smb1360_otp_backup_alg_update(chip);
-		if (rc) {
-			pr_err("Update OTP backup algorithm failed\n");
-			return rc;
 		}
 	} else {
 		pr_debug("Disabling gain correction\n");
@@ -2658,6 +3372,7 @@ static struct irq_handler_info handlers[] = {
 			},
 			{
 				.name		= "safety_timeout",
+				.smb_irq	= saftety_handler,
 			},
 			{
 				.name		= "aicl_done",
@@ -2676,6 +3391,8 @@ static struct irq_handler_info handlers[] = {
 			},
 			{
 				.name		= "usbin_ov",
+				.smb_irq = usbin_ov_handler, //charger voltage higher than 6.5 V,then trigger this interrupt and stop charging.liwei add 20150730
+
 			},
 			{
 				.name		= "unused",
@@ -2712,6 +3429,7 @@ static struct irq_handler_info handlers[] = {
 			},
 			{
 				.name		= "chg_error",
+				.smb_irq	= chg_error_handler,
 			},
 			{
 				.name		= "wd_timeout",
@@ -2776,10 +3494,7 @@ static irqreturn_t smb1360_stat_handler(int irq, void *dev_id)
 	chip->irq_waiting = true;
 	if (!chip->resume_completed) {
 		dev_dbg(chip->dev, "IRQ triggered before device-resume\n");
-		if (!chip->irq_disabled) {
-			disable_irq_nosync(irq);
-			chip->irq_disabled = true;
-		}
+		disable_irq_nosync(irq);
 		mutex_unlock(&chip->irq_complete);
 		return IRQ_HANDLED;
 	}
@@ -2817,6 +3532,7 @@ static irqreturn_t smb1360_stat_handler(int irq, void *dev_id)
 			if ((triggered || changed)
 				&& handlers[i].irq_info[j].smb_irq != NULL) {
 				handler_count++;
+				//pr_log("%s:%s\n",__FUNCTION__,handlers[i].irq_info[j].name); //zhangjiyou delete for bug:74650, @20150901
 				rc = handlers[i].irq_info[j].smb_irq(chip,
 								rt_stat);
 				if (rc < 0)
@@ -3438,6 +4154,8 @@ static int smb1360_check_batt_profile(struct smb1360_chip *chip)
 				(div_u64(chip->connected_rid, 10)))
 			break;
 	}
+	
+	i = 1;// david add fix profile-b
 
 	if (i == BATTERY_PROFILE_MAX) {
 		pr_err("None of the battery-profiles match the connected-RID\n");
@@ -4217,16 +4935,6 @@ static int smb1360_hw_init(struct smb1360_chip *chip)
 		return rc;
 	}
 
-	rc = smb1360_masked_write(chip, CFG_CHG_MISC_REG,
-					CFG_BAT_OV_ENDS_CHG_CYC,
-					chip->ov_ends_chg_cycle_disabled ?
-					0 : CFG_BAT_OV_ENDS_CHG_CYC);
-	if (rc) {
-		dev_err(chip->dev, "Couldn't set bat_ov_ends_charge rc = %d\n"
-									, rc);
-		return rc;
-	}
-
 	/* battery missing detection */
 	rc = smb1360_masked_write(chip, CFG_BATT_MISSING_REG,
 				BATT_MISSING_SRC_THERM_BIT,
@@ -4353,14 +5061,6 @@ static int smb1360_delayed_hw_init(struct smb1360_chip *chip)
 
 	pr_debug("delayed hw init start!\n");
 
-	if (chip->otp_hard_jeita_config) {
-		rc = smb1360_hard_jeita_otp_init(chip);
-		if (rc) {
-			pr_err("Unable to change the OTP hard jeita, rc=%d\n",
-				rc);
-			return rc;
-		}
-	}
 	rc = smb1360_check_batt_profile(chip);
 	if (rc) {
 		pr_err("Unable to modify battery profile, rc=%d\n", rc);
@@ -4507,7 +5207,6 @@ static int smb1360_parse_jeita_params(struct smb1360_chip *chip)
 {
 	int rc = 0;
 	struct device_node *node = chip->dev->of_node;
-	int temp[2];
 
 	if (of_property_read_bool(node, "qcom,config-hard-thresholds")) {
 		rc = of_property_read_u32(node,
@@ -4530,46 +5229,48 @@ static int smb1360_parse_jeita_params(struct smb1360_chip *chip)
 		pr_debug("config_hard_thresholds = %d, cold_bat_decidegc = %d, hot_bat_decidegc = %d\n",
 			chip->config_hard_thresholds, chip->cold_bat_decidegc,
 			chip->hot_bat_decidegc);
-	} else if (of_property_read_bool(node, "qcom,otp-hard-jeita-config")) {
-		rc = of_property_read_u32(node, "qcom,otp-cold-bat-decidegc",
-					&chip->otp_cold_bat_decidegc);
-		if (rc) {
-			pr_err("otp-cold-bat-decidegc property error, rc = %d\n",
-								rc);
-			return -EINVAL;
-		}
-
-		rc = of_property_read_u32(node, "qcom,otp-hot-bat-decidegc",
-					&chip->otp_hot_bat_decidegc);
-
-		if (rc) {
-			pr_err("otp-hot-bat-decidegc property error, rc = %d\n",
-								rc);
-			return -EINVAL;
-		}
-
-		chip->otp_hard_jeita_config = true;
-		rc = of_property_read_u32_array(node,
-				"qcom,otp-hard-jeita-hysteresis", temp, 2);
-		if (rc) {
-			if (rc != -EINVAL) {
-				pr_err("read otp-hard-jeita-hysteresis failed, rc = %d\n",
-					rc);
-				return rc;
-			}
-		} else {
-			chip->cold_hysteresis = temp[0];
-			chip->hot_hysteresis = temp[1];
-		}
-
-		pr_debug("otp_hard_jeita_config = %d, otp_cold_bat_decidegc = %d\n"
-			"otp_hot_bat_decidegc = %d, cold_hysteresis = %d\n"
-			"hot_hysteresis = %d\n",
-			chip->otp_hard_jeita_config,
-			chip->otp_cold_bat_decidegc,
-			chip->otp_hot_bat_decidegc, chip->cold_hysteresis,
-			chip->hot_hysteresis);
 	}
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+	#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+	if (of_property_read_bool(node, "hipad,config-bat-temp")) {
+		rc = of_property_read_u32(node,
+			"hipad,hot-bat-decidegc", &chip->hipad_hot_bat_decidegc);
+		if (rc) {
+			pr_err("hipad hot_bat_decidegc property error, rc = %d\n",
+								rc);
+			return -EINVAL;
+		}
+
+		rc = of_property_read_u32(node,
+			"hipad,warm-bat-decidegc", &chip->hipad_warm_bat_decidegc);
+		if (rc) {
+			pr_err("warm_bat_decidegc property error, rc = %d\n",
+								rc);
+			return -EINVAL;
+		}
+
+		rc = of_property_read_u32(node,
+			"hipad,cool-bat-decidegc", &chip->hipad_cool_bat_decidegc);
+		if (rc) {
+			pr_err("cool_bat_decidegc property error, rc = %d\n",
+								rc);
+			return -EINVAL;
+		}
+
+		rc = of_property_read_u32(node,
+			"hipad,cold-bat-decidegc", &chip->hipad_cold_bat_decidegc);
+		if (rc) {
+			pr_err("cold_bat_decidegc property error, rc = %d\n",
+								rc);
+			return -EINVAL;
+		}
+
+		pr_debug("hipad_hot_bat_decidegc = %d, hipad_warm_bat_decidegc = %d, hipad_cool_bat_decidegc = %d, hipad_cold_bat_decidegc = %d\n", 
+			chip->hipad_hot_bat_decidegc, chip->hipad_warm_bat_decidegc,
+			chip->hipad_cool_bat_decidegc, chip->hipad_cold_bat_decidegc);
+	}
+	#endif
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
 
 	if (of_property_read_bool(node, "qcom,soft-jeita-supported")) {
 		rc = of_property_read_u32(node, "qcom,warm-bat-decidegc",
@@ -4617,20 +5318,6 @@ static int smb1360_parse_jeita_params(struct smb1360_chip *chip)
 		}
 
 		chip->soft_jeita_supported = true;
-	} else {
-		/*
-		 * If no soft JEITA configuration required from devicetree,
-		 * read the default soft JEITA setting for hard JEITA
-		 * configuration sanity check.
-		 */
-		rc = smb1360_get_soft_jeita_threshold(chip,
-				&chip->cool_bat_decidegc,
-				&chip->warm_bat_decidegc);
-		if (rc) {
-			pr_err("get default soft JEITA threshold failed, rc=%d\n",
-							rc);
-			return rc;
-		}
 	}
 
 	pr_debug("soft-jeita-enabled = %d, warm-bat-decidegc = %d, cool-bat-decidegc = %d, cool-bat-mv = %d, warm-bat-mv = %d, cool-bat-ma = %d, warm-bat-ma = %d\n",
@@ -4670,6 +5357,20 @@ static int smb1360_parse_parallel_charging_params(struct smb1360_chip *chip)
 static int smb_parse_dt(struct smb1360_chip *chip)
 {
 	int rc;
+	int is_pvt1;
+	int is_pvt2;
+    int value_108;
+	int value_109;
+    
+	int pcb_check;
+	int pcb_check1;
+	
+	u32 pcb_check_flags;	
+	u32 pcb_check_flags1;
+	
+	int err = 0;
+	int i = 0;
+	
 	struct device_node *node = chip->dev->of_node;
 
 	if (!node) {
@@ -4678,6 +5379,65 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 	}
 
 	chip->rsense_10mohm = of_property_read_bool(node, "qcom,rsense-10mhom");
+
+	#if 1 //david add
+	pcb_check = of_get_named_gpio_flags(node, "hipad,pcb-check",	0, &pcb_check_flags);
+
+	if (pcb_check > 0)
+	{
+		pr_info("find dts property pcb check gpio\n");
+	}
+	
+	err = gpio_request(pcb_check, "pcb_check_gpio");
+
+	if (err) {
+		pr_err("request pcb_check_gpio failed");
+	}
+
+
+	pcb_check1 = of_get_named_gpio_flags(node, "hipad,pcb-check1",	0, &pcb_check_flags1);
+
+	if (pcb_check1 > 0)
+	{
+		pr_info("find dts property pcb check gpio\n");
+	}
+	
+	err = gpio_request(pcb_check1, "pcb_check_gpio1");
+
+	if (err) {
+		pr_err("request pcb_check_gpio failed");
+	}
+
+
+	printk("pcb_check = %d,pcb_check1 = %d\n",pcb_check,pcb_check1);
+	for(i = 0; i < 5; i ++)
+	{
+		mdelay(10);
+		value_108 = gpio_get_value(pcb_check);
+		value_109 = gpio_get_value(pcb_check1);
+	}
+    if((value_108==1)&&(value_109==0))
+    	{
+		is_pvt1=1;
+		is_pvt2=0;
+		chip->is_pvt1 = is_pvt1;
+		chip->is_pvt2 = is_pvt2;
+    	}
+	else if((value_108==1)&&(value_109==1))
+	 {
+		is_pvt2=1;
+		is_pvt1=0;
+		chip->is_pvt1 = is_pvt1;
+		chip->is_pvt2 = is_pvt2;
+	 }
+	else if ((value_108==0)&&(value_109==0))
+	{
+		pr_info(" === %s === pcb is evt!!!\n", __func__);
+		chip->rsense_10mohm = NULL;
+	}
+	pr_log("[david] ====== %s ====== pcb_check_gpio : %d, is_pvt1 : %d, rsense_10mohm: %d\n", __func__, pcb_check, is_pvt1, chip->rsense_10mohm);
+	#endif
+
 
 	if (of_property_read_bool(node, "qcom,batt-profile-select")) {
 		rc = smb_parse_batt_id(chip);
@@ -4711,6 +5471,11 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 		}
 	}
 
+	 if(((chip->is_pvt1==1)&&(chip->is_pvt2==0)) ||  (85 != chip->capcity_reference))
+ 	{
+ 		chip->use_voltage = true;
+ 	}
+	
 	chip->pulsed_irq = of_property_read_bool(node, "qcom,stat-pulsed-irq");
 
 	rc = of_property_read_u32(node, "qcom,float-voltage-mv",
@@ -4737,10 +5502,25 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 	chip->recharge_disabled = of_property_read_bool(node,
 						"qcom,recharge-disabled");
 
-	rc = of_property_read_u32(node, "qcom,iterm-ma", &chip->iterm_ma);
-	if (rc < 0)
-		chip->iterm_ma = -EINVAL;
-
+	 if(chip->use_voltage)
+	 {
+	 	rc = of_property_read_u32(node, "qcom,iterm-ma", &chip->iterm_ma);
+		if (rc < 0)
+		{
+			chip->iterm_ma = -EINVAL;
+		}
+		else
+		{
+			chip->iterm_ma = 100;
+		}
+	 }
+	 else
+	 {	 	
+		rc = of_property_read_u32(node, "qcom,iterm-ma", &chip->iterm_ma);
+		if (rc < 0)
+			chip->iterm_ma = -EINVAL;
+	 }
+   
 	chip->iterm_disabled = of_property_read_bool(node,
 						"qcom,iterm-disabled");
 
@@ -4758,9 +5538,6 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 
 	chip->min_icl_usb100 = of_property_read_bool(node,
 						"qcom,min-icl-100ma");
-
-	chip->ov_ends_chg_cycle_disabled = of_property_read_bool(node,
-					"qcom,disable-ov-ends-chg-cycle");
 
 	rc = smb1360_parse_parallel_charging_params(chip);
 	if (rc) {
@@ -4803,10 +5580,13 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 	if (rc < 0)
 		chip->delta_soc = -EINVAL;
 
-	rc = of_property_read_u32(node, "qcom,fg-soc-max", &chip->soc_max);
-	if (rc < 0)
-		chip->soc_max = -EINVAL;
-
+	chip->soc_max = -EINVAL;
+	 if(chip->use_voltage)
+	 {
+		 rc = of_property_read_u32(node, "qcom,fg-soc-max", &chip->soc_max);
+		if (rc < 0)
+			chip->soc_max = -EINVAL;
+	 }
 	rc = of_property_read_u32(node, "qcom,fg-soc-min", &chip->soc_min);
 	if (rc < 0)
 		chip->soc_min = -EINVAL;
@@ -4902,11 +5682,24 @@ static int smb1360_probe(struct i2c_client *client,
 		return -ENOMEM;
 	}
 
+	chip->last_temp = 0xFFFF;
 	chip->resume_completed = true;
 	chip->client = client;
 	chip->dev = &client->dev;
 	chip->usb_psy = usb_psy;
 	chip->fake_battery_soc = -EINVAL;
+	chip->use_voltage = false;
+	chip->hipad_is_full = false;
+	chip->term_count = 0;
+	
+	/*liwei add for lower the charge_current, @20150728, start*/
+	#ifdef CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+	chip->hipad_usb_present = true;
+	#endif
+	/*liwei add for lower the charge_current, @20150728, end*/
+	
+	chip->charger_overvoltage = false;  //charger voltage higher than 6.5,then stop charging and set charger_overvoltage as true,liwei add 20150730
+
 	mutex_init(&chip->read_write_lock);
 	mutex_init(&chip->parallel_chg_lock);
 	mutex_init(&chip->otp_gain_lock);
@@ -4915,7 +5708,19 @@ static int smb1360_probe(struct i2c_client *client,
 	INIT_DELAYED_WORK(&chip->delayed_init_work,
 			smb1360_delayed_init_work_fn);
 	init_completion(&chip->fg_mem_access_granted);
-	smb1360_wakeup_src_init(chip);
+
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+	#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+	INIT_DELAYED_WORK(&chip->temp_check_work, smb1360_temp_check_work);
+	#endif
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
+
+	/*liwei add for lower the charge_current, @20150728, start*/
+    #ifdef CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+	INIT_DELAYED_WORK(&chip->adjust_charging_current_work,hipad_adjust_charging_current_work);
+	#endif
+
+	/*liwei add for lower the charge_current, @20150728, end*/
 
 	/* probe the device to check if its actually connected */
 	rc = smb1360_read(chip, CFG_BATT_CHG_REG, &reg);
@@ -4923,7 +5728,17 @@ static int smb1360_probe(struct i2c_client *client,
 		pr_err("Failed to detect SMB1360, device may be absent\n");
 		return -ENODEV;
 	}
-
+	 rc = smb1360_read(chip, SOC_MAX_REG, &reg);
+	 
+	 if (rc) {
+		pr_err("Failed to read capacity, device may be absent\n");
+	}
+	 chip->capcity_reference = reg*100/255;
+	 if((chip->capcity_reference > 100) || (chip->capcity_reference < 0))
+ 	{
+ 		chip->capcity_reference  = 85;
+ 	}
+	 
 	rc = read_revision(chip, &chip->revision);
 	if (rc)
 		dev_err(chip->dev, "Couldn't read revision rc = %d\n", rc);
@@ -4934,19 +5749,24 @@ static int smb1360_probe(struct i2c_client *client,
 		return rc;
 	}
 
+	
+		INIT_DELAYED_WORK(&chip->adjust_charging_soc_work,hipad_adjust_charging_soc_work);
+		//INIT_WORK(&chip->hipad_soc_work, hipad_charging_soc_work);
+		//alarm_init(&chip->battery_alarm, ALARM_REALTIME,hipad_battery_update_callback);
+		wake_lock_init(&hipad_chg_wake_lock, WAKE_LOCK_SUSPEND, "hipad-charger"); 
+
 	device_init_wakeup(chip->dev, 1);
 	i2c_set_clientdata(client, chip);
 	mutex_init(&chip->irq_complete);
 	mutex_init(&chip->charging_disable_lock);
 	mutex_init(&chip->current_change_lock);
 	chip->default_i2c_addr = client->addr;
+	atomic_set(&chip->hipad_lock_enable, 0);
 	INIT_WORK(&chip->parallel_work, smb1360_parallel_work);
-	if (chip->cold_hysteresis || chip->hot_hysteresis)
-		INIT_WORK(&chip->jeita_hysteresis_work,
-				smb1360_jeita_hysteresis_work);
+	INIT_DELAYED_WORK(&chip->temp_work, smb1360_temp_work);	
 
 	pr_debug("default_i2c_addr=%x\n", chip->default_i2c_addr);
-	smb1360_otp_backup_pool_init(chip);
+
 	rc = smb1360_hw_init(chip);
 	if (rc < 0) {
 		dev_err(&client->dev,
@@ -5115,6 +5935,20 @@ static int smb1360_probe(struct i2c_client *client,
 				rc);
 	}
 
+       schedule_delayed_work(&chip->temp_work, 60*HZ);
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+	#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+	schedule_delayed_work(&chip->temp_check_work, msecs_to_jiffies(HIPAD_TEMP_CHECK_PERIOD_MS));
+	#endif
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
+	
+	/*liwei add for lower the charge_current, @20150728, start*/
+	#ifdef CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+	schedule_delayed_work(&chip->adjust_charging_current_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_START_MS));
+	#endif
+	//if((chip->is_pvt1==1)&&(chip->is_pvt2==0))
+		//schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_START_MS));
+	/*liwei add for lower the charge_current, @20150728, end*/
 	dev_info(chip->dev, "SMB1360 revision=0x%x probe success! batt=%d usb=%d soc=%d\n",
 			chip->revision,
 			smb1360_get_prop_batt_present(chip),
@@ -5135,6 +5969,27 @@ static int smb1360_remove(struct i2c_client *client)
 	struct smb1360_chip *chip = i2c_get_clientdata(client);
 	regulator_unregister(chip->otg_vreg.rdev);
 	power_supply_unregister(&chip->batt_psy);
+	
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, start*/
+	#ifdef CONFIG_BATTERY_TEMP_CHARGER_CONTROL
+	cancel_delayed_work_sync(&chip->temp_check_work);
+	#endif
+	/*zhangjiyou add for <-5-->50 stop charging, @20150728, end*/
+
+	/*liwei add for lower the charge_current, @20150728, start*/
+	#ifdef	CONFIG_HIPAD_ADJUST_CHARGING_CURRENT
+	cancel_delayed_work_sync(&chip->adjust_charging_current_work);
+	#endif
+	/*liwei add for lower the charge_current, @20150728, end*/
+	//if(chip->use_voltage )
+	//{
+		cancel_delayed_work_sync(&chip->adjust_charging_soc_work);
+		//cancel_work_sync(&chip->hipad_soc_work);
+		//alarm_cancel(&chip->battery_alarm);
+		wake_lock_destroy(&hipad_chg_wake_lock); 
+	//}
+	
+	//del_timer_sync(&chip->battery_timer);
 	mutex_destroy(&chip->charging_disable_lock);
 	mutex_destroy(&chip->current_change_lock);
 	mutex_destroy(&chip->read_write_lock);
@@ -5183,7 +6038,7 @@ static int smb1360_suspend(struct device *dev)
 	mutex_lock(&chip->irq_complete);
 	chip->resume_completed = false;
 	mutex_unlock(&chip->irq_complete);
-
+	pr_log("suspend\n");
 	return 0;
 }
 
@@ -5216,24 +6071,42 @@ static int smb1360_resume(struct device *dev)
 	mutex_lock(&chip->irq_complete);
 	chip->resume_completed = true;
 	if (chip->irq_waiting) {
-		chip->irq_disabled = false;
-		enable_irq(client->irq);
 		mutex_unlock(&chip->irq_complete);
 		smb1360_stat_handler(client->irq, chip);
+		enable_irq(client->irq);
 	} else {
 		mutex_unlock(&chip->irq_complete);
 	}
-
-	power_supply_changed(&chip->batt_psy);
-
+	pr_log("resume\n");
 	return 0;
 }
 
 static void smb1360_shutdown(struct i2c_client *client)
 {
 	int rc;
+	u8 reg = 0;
 	struct smb1360_chip *chip = i2c_get_clientdata(client);
-
+	if(chip->use_voltage )
+	{
+		/*if soc is 85%,then we set soc as 84%.So we can know that if we use voltage for caculating  soc .  */
+		
+		if((chip->hipad_capacity == 85) || (chip->hipad_capacity == 100) ||(chip->hipad_capacity == 99) )
+		{
+			chip->hipad_capacity --;
+		}
+			
+		 if(is_between(chip->hipad_capacity, 0, 100))
+		{
+			reg = DIV_ROUND_UP(chip->hipad_capacity * MAX_8_BITS,
+								100);
+			pr_log("soc=%d reg=%x\n",chip->hipad_capacity, reg);
+			rc = smb1360_write(chip, SOC_MAX_REG, reg);
+			if (rc) {
+				dev_err(chip->dev, "Couldn't write to SOC_MAX_REG rc=%d\n",
+						rc);
+			}
+		}
+	}
 	rc = smb1360_otg_disable(chip);
 	if (rc)
 		pr_err("Couldn't disable OTG mode rc=%d\n", rc);
@@ -5242,7 +6115,7 @@ static void smb1360_shutdown(struct i2c_client *client)
 		rc = smb1360_poweroff(chip);
 		if (rc)
 			pr_err("Couldn't shutdown smb1360, rc = %d\n", rc);
-		pr_info("smb1360 power off\n");
+		pr_log("smb1360 power off\n");
 	}
 }
 

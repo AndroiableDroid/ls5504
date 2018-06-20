@@ -186,6 +186,7 @@ static int tps65132_regulator_set_voltage(struct regulator_dev *rdev,
 {
 	struct tps65132_regulator *vreg = rdev_get_drvdata(rdev);
 	int val, new_uV, rc;
+	int i = 0;///zhangwei add
 
 	if (!rdev->regmap) {
 		pr_err("regmap not found\n");
@@ -201,14 +202,35 @@ static int tps65132_regulator_set_voltage(struct regulator_dev *rdev,
 		return -EINVAL;
 	}
 	if (!vreg->is_enabled) {
+		printk(KERN_ERR "%s:JackChen111 verg->is_enabled = %d\n",__func__,vreg->is_enabled);
 		vreg->vol_set_val = val;
 		vreg->vol_set_postpone = true;
 	} else {
+		printk(KERN_ERR "%s:JackChen222 verg->is_enabled = %d vreg->vol_reg = %d val= %d\n", __func__, vreg->is_enabled, vreg->vol_reg, val);
 		rc = regmap_write(rdev->regmap, vreg->vol_reg, val);
 		if (rc) {
 			pr_err("failed to write reg %d, rc = %d\n",
 						vreg->vol_reg, rc);
-			return rc;
+#if 1 //xiesu add
+
+
+
+
+
+
+
+
+			do
+			{
+				i++;
+				rc = regmap_write(rdev->regmap, vreg->vol_reg, val);
+			}
+			while(rc != 0);
+			printk(KERN_ERR "JackChen OK: i = %d\n", i);
+			//return rc;
+#else
+return rc;
+#endif
 		}
 	}
 	vreg->curr_uV = new_uV;
@@ -255,6 +277,7 @@ static int tps65132_regulator_gpio_init(struct tps65132_chip *chip)
 		vreg = &chip->vreg[i];
 		gpio = vreg->en_gpio;
 		flags = vreg->gpio_flags;
+		printk(KERN_ERR "JackChen:%s gpio[%d] = %d\n", __func__, i, gpio);
 		if (gpio_is_valid(gpio)) {
 			rc = devm_gpio_request(chip->dev, gpio, vreg->name);
 			if (rc < 0) {
@@ -486,6 +509,7 @@ static int tps65132_regulator_probe(struct i2c_client *client,
 	struct regulator_desc *rdesc;
 	int i, j, rc;
 
+	printk(KERN_ERR "JackChen:%s\n", __func__);
 	chip = devm_kzalloc(&client->dev, sizeof(struct tps65132_chip),
 							GFP_KERNEL);
 	if (!chip) {

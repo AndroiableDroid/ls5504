@@ -384,6 +384,7 @@ void xenvif_disconnect(struct xenvif *vif)
 		unbind_from_irqhandler(vif->irq, vif);
 		vif->irq = 0;
 	}
+
 }
 
 void xenvif_free(struct xenvif *vif)

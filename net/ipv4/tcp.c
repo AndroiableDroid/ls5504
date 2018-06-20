@@ -1076,7 +1076,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	if (unlikely(tp->repair)) {
 		if (tp->repair_queue == TCP_RECV_QUEUE) {
 			copied = tcp_send_rcvq(sk, msg, size);
-			goto out_nopush;
+			goto out;
 		}
 
 		err = -EINVAL;
@@ -1249,7 +1249,6 @@ wait_for_memory:
 out:
 	if (copied)
 		tcp_push(sk, flags, mss_now, tp->nonagle);
-out_nopush:
 	release_sock(sk);
 
 	if (copied + copied_syn)
@@ -2772,7 +2771,7 @@ void tcp_get_info(const struct sock *sk, struct tcp_info *info)
 	if (sk->sk_socket) {
 		struct file *filep = sk->sk_socket->file;
 		if (filep)
-			info->tcpi_count = file_count(filep);
+			info->tcpi_count = atomic_read(&filep->f_count);
 	}
 }
 EXPORT_SYMBOL_GPL(tcp_get_info);
@@ -3387,43 +3386,6 @@ void tcp_done(struct sock *sk)
 }
 EXPORT_SYMBOL_GPL(tcp_done);
 
-int tcp_abort(struct sock *sk, int err)
-{
-	if (sk->sk_state == TCP_TIME_WAIT) {
-		inet_twsk_put((struct inet_timewait_sock *)sk);
-		return -EOPNOTSUPP;
-	}
-
-	/* Don't race with userspace socket closes such as tcp_close. */
-	lock_sock(sk);
-
-	if (sk->sk_state == TCP_LISTEN) {
-		tcp_set_state(sk, TCP_CLOSE);
-		inet_csk_listen_stop(sk);
-	}
-
-	/* Don't race with BH socket closes such as inet_csk_listen_stop. */
-	local_bh_disable();
-	bh_lock_sock(sk);
-
-	if (!sock_flag(sk, SOCK_DEAD)) {
-		sk->sk_err = err;
-		/* This barrier is coupled with smp_rmb() in tcp_poll() */
-		smp_wmb();
-		sk->sk_error_report(sk);
-		if (tcp_need_reset(sk->sk_state))
-			tcp_send_active_reset(sk, GFP_ATOMIC);
-		tcp_done(sk);
-	}
-
-	bh_unlock_sock(sk);
-	local_bh_enable();
-	release_sock(sk);
-	sock_put(sk);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(tcp_abort);
-
 extern struct tcp_congestion_ops tcp_reno;
 
 static __initdata unsigned long thash_entries;
@@ -3575,7 +3537,7 @@ int tcp_nuke_addr(struct net *net, struct sockaddr *addr)
 		return -EAFNOSUPPORT;
 	}
 
-	for (bucket = 0; bucket <= tcp_hashinfo.ehash_mask; bucket++) {
+	for (bucket = 0; bucket < tcp_hashinfo.ehash_mask; bucket++) {
 		struct hlist_nulls_node *node;
 		struct sock *sk;
 		spinlock_t *lock = inet_ehash_lockp(&tcp_hashinfo, bucket);
@@ -3621,20 +3583,14 @@ restart:
 			sock_hold(sk);
 			spin_unlock_bh(lock);
 
-			lock_sock(sk);
 			local_bh_disable();
 			bh_lock_sock(sk);
+			sk->sk_err = ETIMEDOUT;
+			sk->sk_error_report(sk);
 
-			if (!sock_flag(sk, SOCK_DEAD)) {
-				smp_wmb();  /* be consistent with tcp_reset */
-				sk->sk_err = ETIMEDOUT;
-				sk->sk_error_report(sk);
-				tcp_done(sk);
-			}
-
+			tcp_done(sk);
 			bh_unlock_sock(sk);
 			local_bh_enable();
-			release_sock(sk);
 			sock_put(sk);
 
 			goto restart;

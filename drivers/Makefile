@@ -4,7 +4,8 @@
 # 15 Sep 2000, Christoph Hellwig <hch@infradead.org>
 # Rewritten to use lists instead of if-statements.
 #
-
+#zhongzhu add for fingerprint=====
+obj-y				+= fingerprint/
 obj-y				+= irqchip/
 obj-y				+= bus/
 
@@ -69,7 +70,6 @@ obj-$(CONFIG_MTD)		+= mtd/
 obj-$(CONFIG_SPI)		+= spi/
 obj-$(CONFIG_SPMI)		+= spmi/
 obj-$(CONFIG_SLIMBUS)		+= slimbus/
-obj-$(CONFIG_SOUNDWIRE)     += soundwire/
 obj-y				+= hsi/
 obj-y				+= net/
 obj-$(CONFIG_ATM)		+= atm/

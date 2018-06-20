@@ -796,11 +796,8 @@ static void bdi_update_write_bandwidth(struct backing_dev_info *bdi,
 	 *                   bw * elapsed + write_bandwidth * (period - elapsed)
 	 * write_bandwidth = ---------------------------------------------------
 	 *                                          period
-	 *
-	 * @written may have decreased due to account_page_redirty().
-	 * Avoid underflowing @bw calculation.
 	 */
-	bw = written - min(written, bdi->written_stamp);
+	bw = written - bdi->written_stamp;
 	bw *= HZ;
 	if (unlikely(elapsed > period)) {
 		do_div(bw, elapsed);
@@ -864,7 +861,7 @@ static void global_update_bandwidth(unsigned long thresh,
 				    unsigned long now)
 {
 	static DEFINE_SPINLOCK(dirty_lock);
-	static unsigned long update_time = INITIAL_JIFFIES;
+	static unsigned long update_time;
 
 	/*
 	 * check locklessly first to optimize away locking for the most time
@@ -1532,12 +1529,6 @@ void throttle_vm_writeout(gfp_t gfp_mask)
                 if (global_page_state(NR_UNSTABLE_NFS) +
 			global_page_state(NR_WRITEBACK) <= dirty_thresh)
                         	break;
-		/* Try safe version */
-		else if (unlikely(global_page_state_snapshot(NR_UNSTABLE_NFS) +
-			global_page_state_snapshot(NR_WRITEBACK) <=
-				dirty_thresh))
-				break;
-
                 congestion_wait(BLK_RW_ASYNC, HZ/10);
 
 		/*

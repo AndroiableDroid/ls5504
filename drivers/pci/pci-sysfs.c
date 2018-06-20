@@ -175,7 +175,7 @@ static ssize_t modalias_show(struct device *dev, struct device_attribute *attr, 
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 
-	return sprintf(buf, "pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
+	return sprintf(buf, "pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02x\n",
 		       pci_dev->vendor, pci_dev->device,
 		       pci_dev->subsystem_vendor, pci_dev->subsystem_device,
 		       (u8)(pci_dev->class >> 16), (u8)(pci_dev->class >> 8),
@@ -1409,6 +1409,7 @@ void pci_remove_sysfs_dev_files(struct pci_dev *pdev)
 		sysfs_remove_bin_file(&pdev->dev.kobj, &pcie_config_attr);
 	else
 		sysfs_remove_bin_file(&pdev->dev.kobj, &pci_config_attr);
+
 
 	pci_remove_resource_files(pdev);
 

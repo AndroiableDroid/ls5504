@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,7 @@
 #include <linux/err.h>
 
 #include "mdss_dsi.h"
+#include "mdss_livedisplay.h"
 
 #define DT_CMD_HDR 6
 
@@ -33,7 +34,8 @@
 #define NT35596_MAX_ERR_CNT 2
 
 #define MIN_REFRESH_RATE 48
-#define DEFAULT_MDP_TRANSFER_TIME 14000
+
+char lcd_info_pr[60]; //chenjian add for lcd info
 
 DEFINE_LED_TRIGGER(bl_led_trigger);
 
@@ -55,7 +57,9 @@ static void mdss_dsi_panel_bklt_pwm(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 	int ret;
 	u32 duty;
 	u32 period_ns;
-
+	int duty_ns,old_duty_ns;
+	static int last_level;
+	
 	if (ctrl->pwm_bl == NULL) {
 		pr_err("%s: no PWM\n", __func__);
 		return;
@@ -77,7 +81,7 @@ static void mdss_dsi_panel_bklt_pwm(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 	duty = level * ctrl->pwm_period;
 	duty /= ctrl->bklt_max;
 
-	pr_debug("%s: bklt_ctrl=%d pwm_period=%d pwm_gpio=%d pwm_lpg_chan=%d\n",
+	pr_debug("%s: lidan  __-----bklt_ctrl=%d pwm_period=%d pwm_gpio=%d pwm_lpg_chan=%d\n",
 			__func__, ctrl->bklt_ctrl, ctrl->pwm_period,
 				ctrl->pwm_pmic_gpio, ctrl->pwm_lpg_chan);
 
@@ -92,16 +96,122 @@ static void mdss_dsi_panel_bklt_pwm(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 			return;
 		}
 	} else {
-		period_ns = ctrl->pwm_period * NSEC_PER_USEC;
-		ret = pwm_config(ctrl->pwm_bl,
-				level * period_ns / ctrl->bklt_max,
-				period_ns);
+
+			period_ns = ctrl->pwm_period * NSEC_PER_USEC;
+			duty_ns=(level * period_ns) / ctrl->bklt_max;
+			
+			old_duty_ns=( 3*4*period_ns / ctrl->bklt_max) ;
+				
+			//printk("\n%s:lidan duty_ns= 100000___11111______level=%d- duty_ns=%d ,old_duty_ns=%d,level=%d\n", __func__,level,duty_ns, old_duty_ns,level);
+			//printk("lidan----------period_ns=%d\n",period_ns);
+			if(level >41 )
+			{
+				level = level - 37;
+				if(level>4 && level <80){
+					int i;
+					duty_ns =old_duty_ns + (level-4)*100;
+					for(i=0; i < 20;i++ ){
+						//printk("----AAAAAAA--------duty_ns=%d, i = %d,last_level=%d,level=%d \n",duty_ns, i,last_level,level );
+						if(last_level < level){
+							ret = pwm_config(ctrl->pwm_bl,duty_ns,period_ns);
+							if (ret) {
+								pr_err("%s: pwm_config() failed err=%d.\n",
+										__func__, ret);
+								return;
+							}
+							duty_ns = duty_ns +5;
+						}else{
+							ret = pwm_config(ctrl->pwm_bl,duty_ns,period_ns);
+							if (ret) {
+								pr_err("%s: pwm_config() failed err=%d.\n",
+										__func__, ret);
+								return;
+							}
+							duty_ns = duty_ns -5;
+
+						}
+						//mdelay(1);
+					}
+					//last_level = level;				
+				}
+				
+				if(level>=80  &&  level <100){
+					int i;
+					duty_ns =  old_duty_ns + 7600 + (level-80)*200;
+					for(i=0; i <20;i++ ){
+						//printk("----BBBBB--------duty_ns=%d, i = %d,last_level=%d,level=%d \n",duty_ns, i,last_level,level );
+						if(last_level < level){
+							ret = pwm_config(ctrl->pwm_bl,duty_ns,period_ns);
+							if (ret) {
+								pr_err("%s: pwm_config() failed err=%d.\n",
+										__func__, ret);
+								return;
+							}
+							duty_ns = duty_ns +10;
+						}else{
+							ret = pwm_config(ctrl->pwm_bl,duty_ns,period_ns);
+							if (ret) {
+								pr_err("%s: pwm_config() failed err=%d.\n",
+										__func__, ret);
+								return;
+							}
+							duty_ns = duty_ns -10;
+
+						}
+						//mdelay(1);
+					}
+					//last_level = level;	
+				}
+				
+				if(level>=100 &&  level <120){
+					duty_ns =   old_duty_ns + 11600  +(level-100)*300;//
+				}
+
+				if(level>=120 &&  level <130){
+					duty_ns =   old_duty_ns + 17600  +(level-120)*350;//
+				}
+				
+				if(level>=130 &&  level <140){
+					duty_ns =   old_duty_ns + 21100  +(level-130)*400;//
+				}
+				
+				if(level>=140 &&  level <150){
+					duty_ns =   old_duty_ns + 25100  +(level-140)*450;//
+				}	
+				
+				if(level>=150 &&  level <=160){
+					duty_ns =   old_duty_ns + 29600 + (level-150)*500;//
+				}
+
+				if(level>=160 &&  level <170){
+					duty_ns =   old_duty_ns + 34600 + (level-160)*550;//
+				}
+				
+				if(level>=170 &&  level <180){
+					duty_ns =   old_duty_ns + 40100 + (level-170)*600;//
+				}	
+
+				if(level>=180 &&  level <=218){
+					duty_ns =   old_duty_ns + 46100 + (level-180)*650;//
+				}
+			}
+			else{
+			
+				duty_ns =1745 + (level-4)*80;
+			}
+			last_level = level;		
+			
+
+		}
+		
+		//printk("\n%s:lidan  ____22222______- duty_ns=%d\n", __func__,duty_ns);
+	
+		ret = pwm_config(ctrl->pwm_bl,duty_ns,period_ns);
 		if (ret) {
 			pr_err("%s: pwm_config() failed err=%d.\n",
 					__func__, ret);
 			return;
 		}
-	}
 
 	if (!ctrl->pwm_enabled) {
 		ret = pwm_enable(ctrl->pwm_bl);
@@ -147,7 +257,7 @@ u32 mdss_dsi_panel_cmd_read(struct mdss_dsi_ctrl_pdata *ctrl, char cmd0,
 	return 0;
 }
 
-static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
+void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
 			struct dsi_panel_cmds *pcmds)
 {
 	struct dcs_cmd_req cmdreq;
@@ -611,7 +721,7 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pr_debug("%s: ctrl=%pK ndx=%d\n", __func__, ctrl, ctrl->ndx);
+	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
 
 	if (pinfo->dcs_cmd_by_left) {
 		if (ctrl->ndx != DSI_CTRL_LEFT)
@@ -621,44 +731,10 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 	if (ctrl->on_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &ctrl->on_cmds);
 
+    mdss_livedisplay_update(ctrl, MODE_UPDATE_ALL);
+
 end:
 	pinfo->blank_state = MDSS_PANEL_BLANK_UNBLANK;
-	pr_debug("%s:-\n", __func__);
-	return 0;
-}
-
-static int mdss_dsi_post_panel_on(struct mdss_panel_data *pdata)
-{
-	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
-	struct mdss_panel_info *pinfo;
-	struct dsi_panel_cmds *on_cmds;
-
-	if (pdata == NULL) {
-		pr_err("%s: Invalid input data\n", __func__);
-		return -EINVAL;
-	}
-
-	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
-				panel_data);
-
-	pr_debug("%s: ctrl=%pK ndx=%d\n", __func__, ctrl, ctrl->ndx);
-
-	pinfo = &pdata->panel_info;
-	if (pinfo->dcs_cmd_by_left) {
-		if (ctrl->ndx != DSI_CTRL_LEFT)
-			goto end;
-	}
-
-	on_cmds = &ctrl->post_panel_on_cmds;
-
-	pr_debug("%s: ctrl=%pK cmd_cnt=%d\n", __func__, ctrl, on_cmds->cmd_cnt);
-
-	if (on_cmds->cmd_cnt) {
-		msleep(50);	/* wait for 3 vsync passed */
-		mdss_dsi_panel_cmds_send(ctrl, on_cmds);
-	}
-
-end:
 	pr_debug("%s:-\n", __func__);
 	return 0;
 }
@@ -677,7 +753,7 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pr_debug("%s: ctrl=%pK ndx=%d\n", __func__, ctrl, ctrl->ndx);
+	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
 
 	if (pinfo->dcs_cmd_by_left) {
 		if (ctrl->ndx != DSI_CTRL_LEFT)
@@ -708,7 +784,7 @@ static int mdss_dsi_panel_low_power_config(struct mdss_panel_data *pdata,
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pr_debug("%s: ctrl=%pK ndx=%d enable=%d\n", __func__, ctrl, ctrl->ndx,
+	pr_debug("%s: ctrl=%p ndx=%d enable=%d\n", __func__, ctrl, ctrl->ndx,
 		enable);
 
 	/* Any panel specific low power commands/config */
@@ -765,7 +841,7 @@ static void mdss_dsi_parse_trigger(struct device_node *np, char *trigger,
 }
 
 
-static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
+int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 		struct dsi_panel_cmds *pcmds, char *cmd_key, char *link_key)
 {
 	const char *data;
@@ -1332,133 +1408,6 @@ static void mdss_dsi_parse_dfps_config(struct device_node *pan_node,
 	return;
 }
 
-void mdss_dsi_unregister_bl_settings(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
-{
-	if (ctrl_pdata->bklt_ctrl == BL_WLED)
-		led_trigger_unregister_simple(bl_led_trigger);
-}
-
-
-/**
- * get_mdss_dsi_even_lane_clam_mask() - Computest DSI lane 0 & 2 clamps mask
- * @dlane_swap: dsi_lane_map_type
- * @lane_id: DSI lane (DSI_LANE_0)/(DSI_LANE_2)
- *
- * Return DSI lane 0 & 2 clamp mask based on lane swap configuration.
- * Clamp Bit for Physical lanes
- *      Lane Num        Bit     Mask
- *      Lane0           Bit 7   0x80
- *      Lane1           Bit 5   0x20
- *      Lane2           Bit 3   0x08
- *      Lane3           Bit 2   0x02
- */
-u32 get_mdss_dsi_even_lane_clam_mask(char dlane_swap,
-				     enum dsi_lane_ids lane_id)
-{
-	u32 lane0_mask = 0;
-	u32 lane2_mask = 0;
-
-	switch (dlane_swap) {
-	case DSI_LANE_MAP_0123:
-	case DSI_LANE_MAP_0321:
-		lane0_mask = 0x80;
-		lane2_mask = 0x08;
-		break;
-	case DSI_LANE_MAP_3012:
-	case DSI_LANE_MAP_1032:
-		lane0_mask = 0x20;
-		lane2_mask = 0x02;
-		break;
-	case DSI_LANE_MAP_2301:
-	case DSI_LANE_MAP_2103:
-		lane0_mask = 0x08;
-		lane2_mask = 0x80;
-		break;
-	case DSI_LANE_MAP_1230:
-	case DSI_LANE_MAP_3210:
-		lane0_mask = 0x02;
-		lane2_mask = 0x20;
-		break;
-	default:
-		lane0_mask = 0x00;
-		lane2_mask = 0x00;
-		break;
-	}
-	if (lane_id == DSI_LANE_0)
-		return lane0_mask;
-	else if (lane_id == DSI_LANE_2)
-		return lane2_mask;
-	else
-		return 0;
-}
-
-/**
- * get_mdss_dsi_odd_lane_clam_mask() - Computest DSI lane 1 & 3 clamps mask
- * @dlane_swap: dsi_lane_map_type
- * @lane_id: DSI lane (DSI_LANE_1)/(DSI_LANE_3)
- *
- * Return DSI lane 1 & 3 clamp mask based on lane swap configuration.
- */
-u32 get_mdss_dsi_odd_lane_clam_mask(char dlane_swap,
-					enum dsi_lane_ids lane_id)
-{
-	u32 lane1_mask = 0;
-	u32 lane3_mask = 0;
-
-	switch (dlane_swap) {
-	case DSI_LANE_MAP_0123:
-	case DSI_LANE_MAP_2103:
-		lane1_mask = 0x20;
-		lane3_mask = 0x02;
-		break;
-	case DSI_LANE_MAP_3012:
-	case DSI_LANE_MAP_3210:
-		lane1_mask = 0x08;
-		lane3_mask = 0x80;
-		break;
-	case DSI_LANE_MAP_2301:
-	case DSI_LANE_MAP_0321:
-		lane1_mask = 0x02;
-		lane3_mask = 0x20;
-		break;
-	case DSI_LANE_MAP_1230:
-	case DSI_LANE_MAP_1032:
-		lane1_mask = 0x80;
-		lane3_mask = 0x08;
-		break;
-	default:
-		lane1_mask = 0x00;
-		lane3_mask = 0x00;
-		break;
-	}
-	if (lane_id == DSI_LANE_1)
-		return lane1_mask;
-	else if (lane_id == DSI_LANE_3)
-		return lane3_mask;
-	else
-		return 0;
-}
-static void mdss_dsi_set_lane_clamp_mask(struct mipi_panel_info *mipi)
-{
-	u32 mask = 0;
-
-	if (mipi->data_lane0)
-		mask = get_mdss_dsi_even_lane_clam_mask(mipi->dlane_swap,
-					DSI_LANE_0);
-	if (mipi->data_lane1)
-		mask |= get_mdss_dsi_odd_lane_clam_mask(mipi->dlane_swap,
-					DSI_LANE_1);
-	if (mipi->data_lane2)
-		mask |= get_mdss_dsi_even_lane_clam_mask(mipi->dlane_swap,
-					DSI_LANE_2);
-	if (mipi->data_lane3)
-		mask |= get_mdss_dsi_odd_lane_clam_mask(mipi->dlane_swap,
-					DSI_LANE_3);
-
-	mipi->phy_lane_clamp_mask = mask;
-}
-
-
 static int mdss_panel_parse_dt(struct device_node *np,
 			struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 {
@@ -1737,8 +1686,6 @@ static int mdss_panel_parse_dt(struct device_node *np,
 	pinfo->mipi.frame_rate = (!rc ? tmp : 60);
 	rc = of_property_read_u32(np, "qcom,mdss-dsi-panel-clockrate", &tmp);
 	pinfo->clk_rate = (!rc ? tmp : 0);
-	rc = of_property_read_u32(np, "qcom,mdss-mdp-transfer-time-us", &tmp);
-	pinfo->mdp_transfer_time_us = (!rc ? tmp : DEFAULT_MDP_TRANSFER_TIME);
 	data = of_get_property(np, "qcom,mdss-dsi-panel-timings", &len);
 	if ((!data) || (len != 12)) {
 		pr_err("%s:%d, Unable to read Phy timing settings",
@@ -1775,9 +1722,6 @@ static int mdss_panel_parse_dt(struct device_node *np,
 
 	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->on_cmds,
 		"qcom,mdss-dsi-on-command", "qcom,mdss-dsi-on-command-state");
-
-	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->post_panel_on_cmds,
-		"qcom,mdss-dsi-post-panel-on-command", NULL);
 
 	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->off_cmds,
 		"qcom,mdss-dsi-off-command", "qcom,mdss-dsi-off-command-state");
@@ -1830,6 +1774,8 @@ static int mdss_panel_parse_dt(struct device_node *np,
 
 	mdss_dsi_parse_dfps_config(np, ctrl_pdata);
 
+	mdss_livedisplay_parse_dt(np, pinfo);
+
 	return 0;
 
 error:
@@ -1861,13 +1807,15 @@ int mdss_dsi_panel_init(struct device_node *node,
 		pr_info("%s: Panel Name = %s\n", __func__, panel_name);
 		strlcpy(&pinfo->panel_name[0], panel_name, MDSS_MAX_PANEL_LEN);
 	}
+
+	strlcpy(lcd_info_pr,panel_name,strlen(panel_name)+1); //chenjian add for lcd info
+
 	rc = mdss_panel_parse_dt(node, ctrl_pdata);
 	if (rc) {
 		pr_err("%s:%d panel dt parse failed\n", __func__, __LINE__);
 		return rc;
 	}
 
-	mdss_dsi_set_lane_clamp_mask(&pinfo->mipi);
 	if (!cmd_cfg_cont_splash)
 		pinfo->cont_splash_enabled = false;
 	pr_info("%s: Continuous splash %s\n", __func__,
@@ -1878,7 +1826,6 @@ int mdss_dsi_panel_init(struct device_node *node,
 	pinfo->esd_rdy = false;
 
 	ctrl_pdata->on = mdss_dsi_panel_on;
-	ctrl_pdata->post_panel_on = mdss_dsi_post_panel_on;
 	ctrl_pdata->off = mdss_dsi_panel_off;
 	ctrl_pdata->low_power_config = mdss_dsi_panel_low_power_config;
 	ctrl_pdata->panel_data.set_backlight = mdss_dsi_panel_bl_ctrl;
